@@ -5,10 +5,10 @@ import {
   TERRAIN_SIZE,
   TERRAIN_GRID,
   riverCenter,
-  riverLevel,
 } from "./terrain-field.js";
 import { height, random } from "./world-data.js";
 import { instanced } from "./impostors.js";
+import { buildRiver } from "./river.js";
 const terrainTiles = [];
 function terrainSurface(x, z, segments) {
   const size = TERRAIN_SIZE / 32,
@@ -173,38 +173,7 @@ export function buildEnvironment(scene, assets) {
       terrainTiles.push({ x: cx, z: cz, levels });
     }
   scene.add(ground);
-  // Water follows the same channel centre and downhill profile used to carve the heightfield.
-  const positions = [],
-    indices = [];
-  for (let i = 0; i <= 1000; i++) {
-    const z = -TERRAIN_SIZE / 2 + (i * TERRAIN_SIZE) / 1000,
-      x = riverCenter(z),
-      y = riverLevel(z);
-    positions.push(x - 7, y, z, x + 7, y, z);
-    if (i < 1000) {
-      const a = i * 2;
-      indices.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
-    }
-  }
-  const waterGeometry = new T.BufferGeometry();
-  waterGeometry.setAttribute(
-    "position",
-    new T.Float32BufferAttribute(positions, 3),
-  );
-  waterGeometry.setIndex(indices);
-  waterGeometry.computeVertexNormals();
-  const water = new T.Mesh(
-    waterGeometry,
-    new T.MeshStandardMaterial({
-      color: 0x426e65,
-      roughness: 0.27,
-      metalness: 0.12,
-      transparent: true,
-      opacity: 0.82,
-      side: T.DoubleSide,
-    }),
-  );
-  scene.add(water);
+  const water = buildRiver(scene, height, lightUniforms);
   const rng = random(607),
     sets = Array.from({ length: 6 }, () => []);
   let count = 0;
@@ -266,5 +235,5 @@ export function buildEnvironment(scene, assets) {
     rocks.castShadow = rocks.receiveShadow = true;
     scene.add(rocks);
   }
-  return { ground, rocks: count };
+  return { ground, water, rocks: count };
 }

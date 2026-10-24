@@ -109,6 +109,7 @@ import {
   terrainCameraFloor,
   setTerrainPreparation,
 } from "./environment.js";
+import { prepareRiver, riverStats } from "./river.js";
 const $ = (id) => document.getElementById(id);
 const diagnostics = (window.worldDiagnostics = {
   ready: false,
@@ -210,6 +211,14 @@ diagnostics.antialiasing = { smaa: false, samples: 4 };
 renderer.info.autoReset = false;
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(-8, height(-8, -23) + 5, -23);
+if (new URLSearchParams(location.search).get("view") === "river") {
+  camera.position.set(
+    riverCenter(12) + 10,
+    height(riverCenter(12) + 10, 12) + 2.2,
+    12,
+  );
+  controls.target.set(riverCenter(-24), riverLevel(-24) + 0.3, -24);
+}
 controls.enableDamping = true;
 controls.dampingFactor = 0.045;
 controls.maxPolarAngle = Math.PI - 0.02;
@@ -445,6 +454,14 @@ const views = [
   [
     [-44, 21, 56],
     [5, 5, -18],
+  ],
+  [
+    [riverCenter(12) + 10, 2.2, 12],
+    [
+      riverCenter(-24),
+      riverLevel(-24) - height(riverCenter(-24), -24) + 0.3,
+      -24,
+    ],
   ],
   [
     [1250, 650, 1350],
@@ -817,9 +834,10 @@ async function loadAssets() {
 const frameClock = new FrameClock();
 let frameTime = 0,
   animationId = null,
-  loopStarted = false;
+  loopStarted = false,
+  capturePaused = false;
 function scheduleFrame() {
-  if (animationId === null && !document.hidden && loopStarted)
+  if (animationId === null && !document.hidden && loopStarted && !capturePaused)
     animationId = requestAnimationFrame(animate);
 }
 document.addEventListener("visibilitychange", () => {
@@ -1002,6 +1020,34 @@ window.worldTest = {
   routes,
   world,
 };
+// Local capture harnesses can render every output frame at a fixed time without
+// making dropped live frames part of an exported movie. Removed in production.
+if (import.meta.env.DEV)
+  window.worldTest.capture = {
+    pause() {
+      capturePaused = true;
+      if (animationId !== null) cancelAnimationFrame(animationId);
+      animationId = null;
+      setPreparationPresenting(false);
+    },
+    render(seconds) {
+      animate(seconds * 1000);
+    },
+    setHour(hour) {
+      cycleRunning = false;
+      worldHour = hour;
+      applySolar();
+      updateSunShadow(true);
+      lightDirty = true;
+    },
+    resume() {
+      capturePaused = false;
+      lastCycleTime = null;
+      frameClock.reset();
+      setPreparationPresenting(true);
+      scheduleFrame();
+    },
+  };
 async function start() {
   await cache.open();
   const assets = await loadAssets();
@@ -1025,8 +1071,14 @@ async function start() {
     cache,
     surfaceIdentity,
   );
+  progress("Baking flowing river surface", 0.025);
+  await prepareRiver(renderer, cache);
   diagnostics.environment = buildEnvironment(scene, assets);
-  diagnostics.environment = { rocks: diagnostics.environment.rocks };
+  window.worldTest.river = diagnostics.environment.water;
+  diagnostics.environment = {
+    rocks: diagnostics.environment.rocks,
+    river: riverStats,
+  };
   clusters = buildTrees(world, assets);
   grass = buildGrass(assets);
   clusters.prepareGroup = (group) => {
