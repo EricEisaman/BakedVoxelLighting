@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>BakedVoxelLighting</title>
+  </head>
+  <body>
+    <canvas id="world"></canvas>
+    <div id="shade"></div>
+    <header>
+      <span class="brandmark">▧</span>
+      <div>
+        <h1>BakedVoxelLighting</h1>
+        <p>A browser-baked landscape</p>
+      </div>
+      <span class="live"><i></i> <span id="backendLabel">THREE.JS</span></span>
+    </header>
+    <main>
+      <div class="eyebrow">WORLD STUDY / 001</div>
+      <h2>Light that<br />stays.</h2>
+      <p class="intro">
+        An open woodland. Warm light, moving grass.<br />A world baked here,
+        remembered here.
+      </p>
+      <div class="actions">
+        <button id="explore">Explore world <span>↗</span></button
+        ><button id="view" class="secondary">Next viewpoint</button>
+      </div>
+    </main>
+    <aside>
+      <div class="panel-head">
+        <span>BAKE STUDIO</span><span id="statusDot">●</span>
+      </div>
+      <div id="status">Preparing the landscape…</div>
+      <div class="progress"><div id="progress"></div></div>
+      <label>Graphics backend<select id="backend"><option value="webgpu">WebGPU · WGSL</option><option value="webgl2">WebGL2 · GLSL</option></select></label>
+      <p id="backendNote" class="note">Switching backend reloads the world; baked data stays cached.</p>
+      <div class="stats">
+        <div><small>LIGHT VOLUME</small><strong id="volume">—</strong></div>
+        <div>
+          <small>LOCAL CACHE</small><strong id="cache">Opening…</strong>
+        </div>
+      </div>
+      <label>Time of day <output id="clockValue">08:08</output><input id="timeOfDay" type="range" min="0" max="23.99" step="0.01" value="8.133333" /></label>
+      <label><input id="dayCycle" type="checkbox" checked /> Day/night cycle · 24 minutes</label>
+      <button id="lookSun" type="button">Look at sun</button>
+      <label
+        >Sun elevation <output id="sunValue">32°</output
+        ><input id="sun" type="range" min="12" max="75" value="32" /></label
+      ><label
+        >Voxel resolution<select id="resolution">
+          <option value="48">48 × 24 × 48 · quick</option>
+          <option value="64">64 × 32 × 64 · quick</option>
+          <option value="96" selected>96 × 48 × 96 · balanced</option>
+        </select></label
+      ><label
+        >Tree HLOD<select id="treeLod">
+          <option value="-1">Automatic distance</option>
+          <option value="0">L0 · full trees</option>
+          <option value="1">L1 · same crown / reduced branches</option>
+          <option value="2">L2 · 16-view canopy + branches</option>
+          <option value="3">L3 · 8-view anchored trees</option>
+        </select></label
+      ><label
+        >Grass LOD<select id="grassLod">
+          <option value="-1">Automatic distance</option>
+          <option value="0">L0 · dense crossed cards</option>
+          <option value="1">L1 · sparse crossed cards</option>
+          <option value="2">L2 · baked patch impostors</option>
+          <option value="3">L3 · ground cover only</option>
+        </select></label
+      >
+      <div class="toggle">
+        <label
+          ><input type="checkbox" id="dynamic" /> Moving light + live GPU
+          bake</label
+        >
+        <label
+          ><input type="checkbox" id="gi" checked /> Voxel lighting on all
+          LODs</label
+        ><label><input type="checkbox" id="lodColors" /> LOD colours</label>
+      </div>
+      <button id="bake" disabled>Bake & cache world <span>↻</span></button
+      ><button class="text-button" id="clear">
+        Clear this project's cache
+      </button>
+      <p class="note">
+        Sun updates live. Moving light refreshes GPU radiance without rebuilding
+        surface atlases. Faded HLOD · no fog.
+      </p>
+    </aside>
+    <footer>
+      <div>
+        <span class="live"><i></i> <b id="fps">—</b> FPS</span
+        ><span id="draws">— draw calls</span
+        ><span id="lodStats">HLOD preparing</span>
+      </div>
+      <div id="hint">
+        Drag to look · Scroll to travel · WASD to walk · Esc to release
+      </div>
+    </footer>
+    <div id="error" hidden></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,222 @@
+import * as T from "three/webgpu";
+import { decorate, lightUniforms } from "./lighting.js";
+import {
+  terrainSample,
+  TERRAIN_SIZE,
+  TERRAIN_GRID,
+  riverCenter,
+  riverLevel,
+} from "./terrain-field.js";
+import { height, random } from "./world-data.js";
+import { instanced } from "./impostors.js";
+const terrainTiles = [];
+// The camera's tile always uses 48 subdivisions; sample its actual rendered triangles.
+export function terrainCameraFloor(x, z) {
+  const size = TERRAIN_SIZE / 32,
+    step = size / 48;
+  const tx =
+    Math.floor((x + TERRAIN_SIZE / 2) / size) * size - TERRAIN_SIZE / 2;
+  const tz =
+    Math.floor((z + TERRAIN_SIZE / 2) / size) * size - TERRAIN_SIZE / 2;
+  const gx = (x - tx) / step,
+    gz = (z - tz) / step,
+    ix = Math.floor(gx),
+    iz = Math.floor(gz),
+    u = gx - ix,
+    v = gz - iz;
+  const xx = tx + ix * step,
+    zz = tz + iz * step,
+    a = height(xx, zz),
+    b = height(xx, zz + step),
+    c = height(xx + step, zz + step),
+    d = height(xx + step, zz);
+  const surface =
+    u + v <= 1
+      ? a + (d - a) * u + (b - a) * v
+      : c + (b - c) * (1 - u) + (d - c) * (1 - v);
+  return Math.max(surface, height(x, z)) + 1.85;
+}
+export function updateTerrain(camera) {
+  for (const tile of terrainTiles) {
+    const d = Math.hypot(
+      camera.position.x - tile.x,
+      camera.position.z - tile.z,
+    );
+    const level = d < 260 ? 0 : d < 850 ? 1 : 2;
+    tile.levels.forEach((mesh, i) => (mesh.visible = i === level));
+  }
+}
+export function buildEnvironment(scene, assets) {
+  lightUniforms.groundMap.value = assets["lush-ground"].map;
+  lightUniforms.rockMap.value = assets.rock.map;
+  lightUniforms.dryGroundMap.value = assets["meadow-ground"].map;
+  const material = decorate(
+    new T.MeshStandardMaterial({
+      map: assets.dirt.map,
+      normalMap: assets.dirt.normal,
+      normalScale: new T.Vector2(0.65, 0.65),
+      roughness: 1,
+      side: T.FrontSide,
+    }),
+    { ground: true, fade: false },
+  );
+  const ground = new T.Group();
+  const size = TERRAIN_SIZE / 32;
+  for (let z = 0; z < 32; z++)
+    for (let x = 0; x < 32; x++) {
+      const cx = -TERRAIN_SIZE / 2 + (x + 0.5) * size,
+        cz = -TERRAIN_SIZE / 2 + (z + 0.5) * size;
+      const riverTile = Math.abs(cx - riverCenter(cz)) < size * 0.75 + 20;
+      const levels = (riverTile ? [48, 48, 48] : [48, 12, 4]).map(
+        (segments) => {
+          const g = new T.PlaneGeometry(size, size, segments, segments);
+          g.rotateX(-Math.PI / 2);
+          const p = g.attributes.position,
+            n = g.attributes.normal;
+          for (let i = 0; i < p.count; i++) {
+            const wx = p.getX(i) + cx,
+              wz = p.getZ(i) + cz;
+            p.setXYZ(i, wx, height(wx, wz), wz);
+            const normal = new T.Vector3(
+              height(wx - 1, wz) - height(wx + 1, wz),
+              2,
+              height(wx, wz - 1) - height(wx, wz + 1),
+            ).normalize();
+            n.setXYZ(i, normal.x, normal.y, normal.z);
+          }
+          // Add vertical skirts without depressing the sampled top surface.
+          const positions = Array.from(p.array),
+            normals = Array.from(n.array),
+            uvs = Array.from(g.attributes.uv.array),
+            indices = Array.from(g.index.array);
+          const edge = [];
+          for (let i = 0; i < segments; i++) edge.push(i);
+          for (let i = 0; i < segments; i++)
+            edge.push(i * (segments + 1) + segments);
+          for (let i = segments; i > 0; i--)
+            edge.push(segments * (segments + 1) + i);
+          for (let i = segments; i > 0; i--) edge.push(i * (segments + 1));
+          const base = p.count;
+          edge.forEach((i) => {
+            positions.push(p.getX(i), p.getY(i) - 32, p.getZ(i));
+            normals.push(n.getX(i), n.getY(i), n.getZ(i));
+            uvs.push(g.attributes.uv.getX(i), g.attributes.uv.getY(i));
+          });
+          edge.forEach((a, i) => {
+            const j = (i + 1) % edge.length,
+              b = edge[j];
+            indices.push(a, b, base + i, b, base + j, base + i);
+          });
+          g.setAttribute(
+            "position",
+            new T.Float32BufferAttribute(positions, 3),
+          );
+          g.setAttribute("normal", new T.Float32BufferAttribute(normals, 3));
+          g.setAttribute("uv", new T.Float32BufferAttribute(uvs, 2));
+          g.setIndex(indices);
+          const mesh = new T.Mesh(g, material);
+          mesh.userData.terrainTile = true;
+          mesh.receiveShadow = true;
+          mesh.visible = false;
+          ground.add(mesh);
+          return mesh;
+        },
+      );
+      terrainTiles.push({ x: cx, z: cz, levels });
+    }
+  scene.add(ground);
+  // Water follows the same channel centre and downhill profile used to carve the heightfield.
+  const positions = [],
+    indices = [];
+  for (let i = 0; i <= 1000; i++) {
+    const z = -TERRAIN_SIZE / 2 + (i * TERRAIN_SIZE) / 1000,
+      x = riverCenter(z),
+      y = riverLevel(z);
+    positions.push(x - 7, y, z, x + 7, y, z);
+    if (i < 1000) {
+      const a = i * 2;
+      indices.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
+    }
+  }
+  const waterGeometry = new T.BufferGeometry();
+  waterGeometry.setAttribute(
+    "position",
+    new T.Float32BufferAttribute(positions, 3),
+  );
+  waterGeometry.setIndex(indices);
+  waterGeometry.computeVertexNormals();
+  const water = new T.Mesh(
+    waterGeometry,
+    new T.MeshStandardMaterial({
+      color: 0x426e65,
+      roughness: 0.27,
+      metalness: 0.12,
+      transparent: true,
+      opacity: 0.82,
+      side: T.DoubleSide,
+    }),
+  );
+  scene.add(water);
+  const rng = random(607),
+    sets = Array.from({ length: 6 }, () => []);
+  let count = 0;
+  for (let cluster = 0; cluster < 800; cluster++) {
+    let x, z, land;
+    for (let tries = 0; tries < 30; tries++) {
+      x = (rng() - 0.5) * (TERRAIN_SIZE - 80);
+      z = (rng() - 0.5) * (TERRAIN_SIZE - 80);
+      land = terrainSample(x, z);
+      if (land.slope > 0.09 && land.traffic < 0.04) break;
+    }
+    if (land.traffic > 0.05) continue;
+    for (let j = 0; j < 5 + Math.floor(rng() * 9); j++) {
+      const a = rng() * 6.28,
+        r = j === 0 ? 0 : rng() * 9,
+        xx = x + Math.cos(a) * r,
+        zz = z + Math.sin(a) * r,
+        s = terrainSample(xx, zz);
+      if (s.traffic > 0.08) continue;
+      const scale = j === 0 ? 1.2 + rng() * 2 : 0.18 + rng() * 0.9;
+      sets[Math.floor(rng() * 6)].push({
+        p: [xx, s.height - scale * 0.34, zz],
+        r: [(rng() - 0.5) * 0.35, rng() * 6.28, (rng() - 0.5) * 0.3],
+        s: [
+          scale * (1 + rng() * 0.5),
+          scale * (0.6 + rng() * 0.4),
+          scale * (0.7 + rng() * 0.5),
+        ],
+      });
+      count++;
+    }
+  }
+  for (let k = 0; k < 6; k++) {
+    const g = new T.IcosahedronGeometry(1, 2),
+      p = g.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      const x = p.getX(i),
+        y = p.getY(i),
+        z = p.getZ(i),
+        n =
+          1 +
+          0.13 * Math.sin(x * 4 + k) * Math.cos(z * 5 - k) +
+          0.08 * Math.sin(y * 7 + x * 3);
+      p.setXYZ(i, x * n, y * n * (0.8 + 0.08 * k), z * n);
+    }
+    g.computeVertexNormals();
+    const m = decorate(
+      new T.MeshStandardMaterial({
+        map: assets.rock.map,
+        normalMap: assets.rock.normal,
+        normalScale: new T.Vector2(0.75, 0.75),
+        color: 0xb5b3a1,
+        roughness: 1,
+      }),
+      { fade: false },
+    );
+    const rocks = instanced(g, m, sets[k]);
+    rocks.userData.voxelKind="rock";
+    rocks.castShadow = rocks.receiveShadow = true;
+    scene.add(rocks);
+  }
+  return { ground, rocks: count };
+}

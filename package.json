@@ -1,0 +1,36 @@
+{
+  "name": "bakedvoxellighting",
+  "version": "1.0.0",
+  "description": "Desktop Three.js woodland with browser GPU baking, indexed streaming, vegetation HLOD and a 24-minute day/night cycle.",
+  "main": "index.js",
+  "scripts": {
+    "test": "node scripts/verify.mjs",
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "test:merged": "node scripts/verify-merged.mjs",
+    "test:landscape": "node scripts/landscape-data.mjs",
+    "test:frames": "node scripts/verify-frame-clock.mjs && node scripts/verify-frame-browser.mjs",
+    "test:terrain-faces": "node scripts/verify-terrain-faces.mjs",
+    "test:backends": "node scripts/verify-backends.mjs webgpu && node scripts/verify-backends.mjs webgl2"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "prettier": "^3.9.10",
+    "vite": "^8.3.5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SamG-Coder/BakedVoxelLighting.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SamG-Coder/BakedVoxelLighting/issues"
+  },
+  "homepage": "https://github.com/SamG-Coder/BakedVoxelLighting#readme"
+}

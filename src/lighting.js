@@ -1,0 +1,376 @@
+import { nativeVolumeSource } from "./native-kernels.js";
+import tslBakeSource from "./tsl-baking.js?raw";
+import { volumePass, readPixels } from "./tsl-baking.js";
+import { decorateTSL, fadeTSL } from "./tsl-materials.js";
+import * as T from "three/webgpu";
+import { digest } from "./cache.js";
+import {
+  TERRAIN_SIZE,
+  rootInfluence,
+  terrainPixels,
+  TERRAIN_GRID,
+} from "./terrain-field.js";
+export { makeNormal } from "./normal-map.js";
+export const terrainTexture = new T.DataTexture(
+  terrainPixels,
+  TERRAIN_GRID,
+  TERRAIN_GRID,
+  T.RGBAFormat,
+  T.FloatType,
+);
+terrainTexture.needsUpdate = true;
+const rootTexture = new T.DataTexture(
+  rootInfluence,
+  TERRAIN_GRID,
+  TERRAIN_GRID,
+  T.RedFormat,
+  T.FloatType,
+);
+rootTexture.minFilter = rootTexture.magFilter = T.LinearFilter;
+rootTexture.needsUpdate = true;
+export const volumeMin = new T.Vector3(-128, -12, -128),
+  volumeSize = new T.Vector3(256, 64, 256);
+// Cache identities include the actual TSL source, not an obsolete GLSL copy.
+const fallback = new T.DataTexture(
+  new Uint8Array([38, 45, 52, 255]),
+  1,
+  1,
+  T.RGBAFormat,
+);
+fallback.minFilter = fallback.magFilter = T.LinearFilter;
+fallback.needsUpdate = true;
+export const lightUniforms = {
+  bakedAtlas: { value: fallback },
+  bakeDims: { value: new T.Vector3(1, 1, 1) },
+  volumeMin: { value: volumeMin.clone() },
+  volumeSize: { value: volumeSize },
+  bakedEnabled: { value: 0 },
+  time: { value: 0 },
+  daylight: {value:1},
+  terrainField: { value: terrainTexture },
+  rootField: { value: rootTexture },
+  liveSunDirection: { value: new T.Vector3(-0.6, 0.6, -0.5) },
+  liveLampPosition: { value: new T.Vector3() },
+  liveLampPower: { value: 0 },
+  groundMap: { value: null },
+  grassGround: { value: fallback.clone() },
+  directionAtlas: { value: fallback.clone() },
+  dryGroundMap: { value: null },
+  rockMap: { value: null },
+};
+export function fadeMaterial(material) {
+  return fadeTSL(material);
+}
+export function decorate(material, options = {}) {
+  return decorateTSL(material, options, lightUniforms, TERRAIN_GRID);
+}
+let active = null;
+export const lightingState = {
+  updates: 0,
+  lastSubmitMs: 0,
+  geometryKey: "",
+  n: 0,
+};
+function reorder(packed, n) {
+  const data = new Uint8Array(packed.length);
+  for (let y = 0; y < n / 2; y++)
+    for (let z = 0; z < n; z++)
+      for (let x = 0; x < n; x++) {
+        const a = (x + n * (z + n * y)) * 4,
+          b = (x + n * (y + (n / 2) * z)) * 4;
+        data.set(packed.subarray(a, a + 4), b);
+      }
+  return data;
+}
+function data3D(data, n) {
+  const t = new T.Data3DTexture(data, n, n / 2, n);
+  t.format = T.RGBAFormat;
+  t.minFilter = t.magFilter = T.LinearFilter;
+  t.unpackAlignment = 1;
+  t.needsUpdate = true;
+  return t;
+}
+export function refreshLighting(
+  renderer,
+  sun,
+  position = new T.Vector3(),
+  power = 0,
+) {
+  if (!active) return;
+  lightUniforms.liveSunDirection.value.copy(sun);
+  lightUniforms.liveLampPosition.value.copy(position);
+  lightUniforms.liveLampPower.value = power;
+  const start = performance.now(),
+    old = renderer.getRenderTarget();
+  active.material.uniforms.sun.value.copy(sun);
+  active.material.uniforms.lampPosition.value.copy(position);
+  active.material.uniforms.lampPower.value = power;
+  renderer.setRenderTarget(active.target);
+  renderer.render(active.scene, active.camera);
+  renderer.setRenderTarget(old);
+  lightUniforms.bakedAtlas.value = active.target.texture;
+  lightingState.updates++;
+  lightingState.lastSubmitMs = performance.now() - start;
+}
+export async function bakeVolume(
+  renderer,
+  world,
+  cache,
+  n,
+  sun,
+  assetHash,
+  onProgress,
+) {
+  const start = performance.now();
+  const geometryKey =
+    "occupancy:" +
+    (await digest(
+      JSON.stringify({
+        world: world.bakeIdentity,
+        n,
+        origin: volumeMin.toArray(),
+        assetHash,
+        shader: nativeVolumeSource + tslBakeSource,
+      }),
+    ));
+  let geometry = await cache.get(geometryKey);
+  const target = new T.RenderTarget(n, (n * n) / 2, {
+    depthBuffer: false,
+    minFilter: T.LinearFilter,
+    magFilter: T.LinearFilter,
+  });
+  const dims = new T.Vector3(n, n / 2, n),
+    uniforms = {
+      dims: { value: dims },
+      vmin: { value: volumeMin },
+      extent: { value: volumeSize },
+      terrainField: { value: terrainTexture },
+      rootField: { value: rootTexture },
+      liveSunDirection: { value: new T.Vector3(-0.6, 0.6, -0.5) },
+      liveLampPosition: { value: new T.Vector3() },
+      liveLampPower: { value: 0 },
+    };
+  const scene = new T.Scene(),
+    camera = new T.OrthographicCamera(-1, 1, 1, -1, 0, 1),
+    quad = new T.Mesh(new T.PlaneGeometry(2, 2));
+  scene.add(quad);
+  const old = renderer.getRenderTarget();
+  if (!geometry) {
+    onProgress("Voxelizing eroded terrain & woodland", 0.08);
+    const detailRecord = await world.buildVoxelDetails(
+      world,
+      n,
+      volumeMin,
+      volumeSize,
+    );
+    const detailTexture = data3D(detailRecord.data, n);
+    const treeData = new Float32Array(1100 * 4);
+    const localTrees = world.areaIndexes.trees.query(volumeMin.x,volumeMin.z,volumeMin.x+volumeSize.x,volumeMin.z+volumeSize.z);
+    localTrees
+      .slice(0, 1100)
+      .forEach((t, i) => treeData.set([t.x, t.y, t.z, t.scale], i * 4));
+    const trees = new T.DataTexture(
+      treeData,
+      1100,
+      1,
+      T.RGBAFormat,
+      T.FloatType,
+    );
+    trees.needsUpdate = true;
+    quad.material = volumePass(
+      "occupancy",
+      {
+        ...uniforms,
+        trees: { value: trees },
+        treeCount: { value: Math.min(localTrees.length, 1100) },
+        details: { value: detailTexture },
+      },
+      TERRAIN_GRID,
+    );
+    try {
+      renderer.setRenderTarget(target);
+      renderer.render(scene, camera);
+      renderer.setRenderTarget(old);
+      const packed = new Uint8Array(((n * n * n) / 2) * 4);
+      await readPixels(renderer, target, 0, 0, n, (n * n) / 2, packed);
+      geometry = {
+        data: reorder(packed, n),
+        n,
+        kinds: detailRecord.kinds,
+        contributors: detailRecord.counts,
+      };
+      await cache.put(geometryKey, geometry);
+    } finally {
+      renderer.setRenderTarget(old);
+      quad.material.dispose();
+      trees.dispose();
+      detailTexture.dispose();
+    }
+  }
+  lightingState.contributors = geometry.contributors;
+  const field = data3D(geometry.data, n);
+  const transportKey =
+    "transport:" + (await digest(geometryKey + nativeVolumeSource + tslBakeSource + "transport"));
+  let transport = await cache.get(transportKey);
+  lightingState.transportCacheHit = !!transport;
+  if (!transport) {
+    const buffers = [];
+    quad.material = volumePass(
+      "transport",
+      {
+        ...uniforms,
+        field: { value: field },
+        directionMode: { value: 0 },
+      },
+      TERRAIN_GRID,
+    );
+    try {
+      for (let mode = 0; mode < 2; mode++) {
+        quad.material.uniforms.directionMode.value = mode;
+        renderer.setRenderTarget(target);
+        renderer.render(scene, camera);
+        renderer.setRenderTarget(old);
+        const pixels = new Uint8Array(((n * n * n) / 2) * 4);
+        await readPixels(renderer, target, 0, 0, n, (n * n) / 2, pixels);
+        buffers.push(pixels);
+      }
+    } finally {
+      renderer.setRenderTarget(old);
+      quad.material.dispose();
+    }
+    transport = { data: buffers[0], directions: buffers[1], n };
+    await cache.put(transportKey, transport);
+  }
+  const transportMap = new T.DataTexture(
+    transport.data,
+    n,
+    (n * n) / 2,
+    T.RGBAFormat,
+  );
+  transportMap.needsUpdate = true;
+  transportMap.minFilter = transportMap.magFilter = T.LinearFilter;
+  const directionMap = new T.DataTexture(
+    transport.directions,
+    n,
+    (n * n) / 2,
+    T.RGBAFormat,
+  );
+  directionMap.needsUpdate = true;
+  directionMap.minFilter = directionMap.magFilter = T.LinearFilter;
+  lightUniforms.directionAtlas.value = directionMap;
+  lightingState.transportKey = transportKey;
+  lightingState.transportBakes = (lightingState.transportBakes || 0) + 1;
+  quad.material = volumePass(
+    "lighting",
+    {
+      ...uniforms,
+      field: { value: field },
+      transportMap: { value: transportMap },
+      sun: { value: sun.clone() },
+      lampPosition: { value: new T.Vector3() },
+      lampPower: { value: 0 },
+    },
+    TERRAIN_GRID,
+  );
+  if (active) {
+    active.target.dispose();
+    active.field.dispose();
+    active.transportMap?.dispose();
+    active.directionMap?.dispose();
+    active.material.dispose();
+    active.quad.geometry.dispose();
+    active.cachedTexture?.dispose();
+  }
+  active = {
+    target,
+    field,
+    geometry,
+    directionMap,
+    transport,
+    transportMap,
+    origin: volumeMin.clone(),
+    scene,
+    camera,
+    quad,
+    material: quad.material,
+    cachedTexture: null,
+  };
+  lightUniforms.volumeMin.value.copy(volumeMin);
+  lightUniforms.bakeDims.value.copy(dims);
+  refreshLighting(renderer,sun);
+  lightUniforms.bakedEnabled.value = 1;
+  lightingState.geometryKey = geometryKey;
+  lightingState.n = n;
+  const key =
+    "lighting:" +
+    (await digest(
+      geometryKey + sun.toArray().join(",") + nativeVolumeSource + tslBakeSource + "lighting",
+    ));
+  let record = await cache.get(key);
+  const cached = !!record;
+  onProgress(
+    cached ? "Restoring cached lighting" : "Baking sky, sun & diffuse bounce",
+    0.24,
+  );
+  if (!record) {
+    refreshLighting(renderer, sun);
+    const data = new Uint8Array(((n * n * n) / 2) * 4);
+    await readPixels(renderer, target, 0, 0, n, (n * n) / 2, data);
+    record = { data, n, key };
+    await cache.put(key, record);
+  } else {
+    const texture = new T.DataTexture(
+      record.data,
+      n,
+      (n * n) / 2,
+      T.RGBAFormat,
+    );
+    texture.minFilter = texture.magFilter = T.LinearFilter;
+    texture.needsUpdate = true;
+    active.cachedTexture = texture;
+    lightUniforms.bakedAtlas.value = texture;
+  }
+  return {
+    key,
+    ms: performance.now() - start,
+    bytes: record.data.byteLength,
+    cached,
+  };
+}
+export async function readLighting(renderer) {
+  if (!active) return null;
+  refreshLighting(
+    renderer,
+    active.material.uniforms.sun.value,
+    active.material.uniforms.lampPosition.value,
+    active.material.uniforms.lampPower.value,
+  );
+  const n = lightingState.n,
+    data = new Uint8Array(((n * n * n) / 2) * 4);
+  await readPixels(renderer, active.target, 0, 0, n, (n * n) / 2, data);
+  return data;
+}
+
+// Read-only probes for tools/visibility planning; partial vegetation is never treated as a solid occluder.
+export function voxelProbe(position) {
+  if (!active) return null;
+  const n = lightingState.n,
+    p = new T.Vector3(...position).sub(active.origin).divide(volumeSize);
+  if (p.x < 0 || p.y < 0 || p.z < 0 || p.x >= 1 || p.y >= 1 || p.z >= 1)
+    return null;
+  const x = Math.floor(p.x * n),
+    y = Math.floor((p.y * n) / 2),
+    z = Math.floor(p.z * n),
+    i = (x + n * (y + (n / 2) * z)) * 4,
+    a = (x + n * (z + n * y)) * 4;
+  return {
+    opacity: active.geometry.data[i + 3] / 255,
+    materialKinds: active.geometry.kinds?.[i / 4] || 0,
+    skyVisibility: active.transport.directions[a + 3] / 255,
+    incomingDirection: Array.from(
+      active.transport.directions.slice(a, a + 3),
+      (v) => (v / 255) * 2 - 1,
+    ),
+    indirect: Array.from(active.transport.data.slice(a, a + 3), (v) => v / 255),
+  };
+}
