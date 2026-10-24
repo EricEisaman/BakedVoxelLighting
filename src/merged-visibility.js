@@ -11,6 +11,7 @@ import { billboardTSL } from "./tsl-materials.js";
 import * as T from "three/webgpu";
 import { BakeCache } from "./cache.js";
 import { decorate, fadeMaterial } from "./lighting.js";
+import { replaceLODLevel } from "./vegetation-lod.js";
 
 const cache = new BakeCache("BakedVoxelLightingMerged");
 const ready = cache.open();
@@ -115,11 +116,7 @@ async function install(c, record, clusters, version) {
     mesh.material.dispose();
     return;
   }
-  group.visible = c.levels[3].visible;
-  c.unmergedFar = c.levels[3];
-  c.unmergedFar.visible = false;
-  c.unmergedFar.removeFromParent();
-  c.levels[3] = group;
+  c.unmergedFar = replaceLODLevel(c, 3, group);
   mergedStats.baked++;
   clusters.lodRevision = (clusters.lodRevision || 0) + 1;
 }

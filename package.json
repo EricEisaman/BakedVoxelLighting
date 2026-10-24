@@ -10,6 +10,7 @@
     "build:pages": "vite build --base /BakedVoxelLighting/",
     "preview": "vite preview --host 127.0.0.1",
     "test:merged": "node scripts/verify-merged.mjs",
+    "test:lod-handoff": "node scripts/verify-lod-handoff.mjs",
     "test:landscape": "node scripts/landscape-data.mjs",
     "test:frames": "node scripts/verify-frame-clock.mjs && node scripts/verify-frame-browser.mjs",
     "test:terrain-faces": "node scripts/verify-terrain-faces.mjs",
