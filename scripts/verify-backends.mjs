@@ -39,6 +39,7 @@ try {
     { timeout: 180000 },
   );
   await page.waitForTimeout(3000);
+  assert.deepEqual(errors, []);
   console.log(
     "STATE",
     await page.evaluate(() => ({
@@ -78,24 +79,38 @@ try {
       const r = db.transaction("bakes").objectStore("bakes").getAll();
       r.onsuccess = () => ok(r.result);
     });
-    const atlases = records.filter((r) => r.normals);
+    const atlases = records.filter((r) => r.normals && !r.topDown);
     const coverage = atlases.map((r) => {
-      let a = 0, t = 0, colour = 0;
+      let a = 0,
+        t = 0,
+        colour = 0;
       for (let i = 3; i < r.data.length; i += 4) {
         if (r.data[i] > 50) {
           a++;
-          if (r.data[i-3]+r.data[i-2]+r.data[i-1] > 12) colour++;
-        }
-        else t++;
+          if (r.data[i - 3] + r.data[i - 2] + r.data[i - 1] > 12) colour++;
+        } else t++;
       }
       return { a, t, colour };
     });
-    let cutouts=0,missingCutoffs=0;
-    w.scene.traverse(o=>{if(o.isMesh && o.material.userData.alphaCutoff>0){cutouts++;if(o.material.alphaTest<=0)missingCutoffs++;}});
-    const mipLevels=atlases.map(r=>r.mips?.length||0);
+    let cutouts = 0,
+      missingCutoffs = 0;
+    w.scene.traverse((o) => {
+      if (o.isMesh && o.material.userData.alphaCutoff > 0) {
+        cutouts++;
+        if (o.material.alphaTest <= 0) missingCutoffs++;
+      }
+    });
+    const mipLevels = atlases.map((r) => r.mips?.length || 0);
     const normals = await billboardNormalCheck(w.renderer);
     return {
-      normals,cutouts,missingCutoffs,mipLevels,
+      normals,
+      cutouts,
+      missingCutoffs,
+      mipLevels,
+      expectedAtlases:
+        w.clusters.prototypes.length * 2 +
+        w.grass.templates.length +
+        w.shrubs.prototypes.length,
       gradient: [...pixels],
       dynamicDelta: delta,
       coverage,
@@ -109,11 +124,15 @@ try {
   assert.equal(measures.gradient[1], 32);
   assert.equal(measures.gradient[61], 223);
   assert.ok(measures.dynamicDelta > 1000);
-  assert.equal(measures.coverage.length, 21);
-  assert.ok(measures.cutouts>0);
-  assert.equal(measures.missingCutoffs,0);
-  assert.ok(measures.mipLevels.every(n=>n>=8));
-  assert.ok(measures.coverage.every((v) => v.a > 1000 && v.t > 1000 && v.colour > v.a * .8));
+  assert.equal(measures.coverage.length, measures.expectedAtlases);
+  assert.ok(measures.cutouts > 0);
+  assert.equal(measures.missingCutoffs, 0);
+  assert.ok(measures.mipLevels.every((n) => n >= 8));
+  assert.ok(
+    measures.coverage.every(
+      (v) => v.a > 1000 && v.t > 1000 && v.colour > v.a * 0.8,
+    ),
+  );
   for (const value of measures.normals)
     for (let i = 0; i < 3; i++)
       assert.ok(
@@ -146,7 +165,7 @@ try {
   assert.equal(warm.backend, other);
   assert.equal(warm.key, key);
   assert.equal(warm.misses, 0);
-  assert.equal(warm.hits, 51);
+  assert.ok(warm.hits > measures.expectedAtlases);
   assert.deepEqual(errors, []);
   console.log("SWITCH", warm);
   await writeFile(

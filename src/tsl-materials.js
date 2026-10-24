@@ -1,4 +1,4 @@
-import {cloudAt} from "./clouds.js";
+import { cloudAt, CLOUD_SHADOW_STRENGTH } from "./clouds.js";
 import * as K from "./native-kernels.js";
 import * as T from "three/webgpu";
 import * as N from "three/tsl";
@@ -26,28 +26,53 @@ const yawNode = () =>
       return N.atan(m.element(0).z.negate(), m.element(0).x);
     })(),
   );
-const rotate = (v,a) => K.rotatePlant({v,a});
-export function sampleVolume(U,name,p,fallback) {
-  const map = texRef(U,name);
-  const flipY = N.uniform(0).onRenderUpdate(() => U[name].value?.isRenderTargetTexture ? 1 : 0);
-  return K.sampleAtlas({map,linearSampler:N.sampler(map),p,
-    origin:ref(U,'volumeMin','vec3'),extent:ref(U,'volumeSize','vec3'),
-    dims:ref(U,'bakeDims','vec3'),fallback:N.vec4(...fallback),flipY});
+const rotate = (v, a) => K.rotatePlant({ v, a });
+export const grassAtlasUV = (count) =>
+  N.varying(
+    N.vec2(
+      N.uv()
+        .x.mul(1 - 2 / 1024)
+        .add(1 / 1024)
+        .add(N.attribute("plantType", "float"))
+        .div(count),
+      N.uv().y,
+    ),
+  );
+export function sampleVolume(U, name, p, fallback) {
+  const map = texRef(U, name);
+  const flipY = N.uniform(0).onRenderUpdate(() =>
+    U[name].value?.isRenderTargetTexture ? 1 : 0,
+  );
+  return K.sampleAtlas({
+    map,
+    linearSampler: N.sampler(map),
+    p,
+    origin: ref(U, "volumeMin", "vec3"),
+    extent: ref(U, "volumeSize", "vec3"),
+    dims: ref(U, "bakeDims", "vec3"),
+    fallback: N.vec4(...fallback),
+    flipY,
+  });
 }
 const fullFade = new T.Vector2(0, 1);
 const fadeRange = N.uniform(fullFade).onObjectUpdate(
   ({ object }) => object.material.userData.fade?.value || fullFade,
 );
-const fadeMask = K.fadeMask({p:N.screenCoordinate.xy,range:fadeRange});
+const fadeMask = K.fadeMask({ p: N.screenCoordinate.xy, range: fadeRange });
 export function fadeTSL(material) {
   // Three r186 NodeMaterial.copy skips inherited alphaTest's private backing field.
   // Preserve the cutoff explicitly when cloning shared material templates.
   material.alphaTest = material.userData.alphaCutoff ?? material.alphaTest;
   material.userData.fade = { value: new T.Vector2(0, 1) };
-  material.maskNode = material.map && material.alphaTest > 0
-    ? fadeMask.and((material.opacityNode || N.texture(material.map).a).greaterThan(N.float(material.alphaTest)))
-    : fadeMask;
-  if(material.alphaTest > 0) material.alphaToCoverage = true;
+  material.maskNode =
+    material.map && material.alphaTest > 0
+      ? fadeMask.and(
+          (material.opacityNode || N.texture(material.map).a).greaterThan(
+            N.float(material.alphaTest),
+          ),
+        )
+      : fadeMask;
+  if (material.alphaTest > 0) material.alphaToCoverage = true;
   return material;
 }
 const templates = new Map();
@@ -78,6 +103,7 @@ function createDecorated(original, options, U, grid) {
     fade = true,
     transmission = 0,
     grass = false,
+    grassAtlas = 0,
   } = options;
   const m = new T.MeshStandardNodeMaterial();
   // Copy standard properties without copying GLSL hooks or changing NodeMaterial's type.
@@ -103,27 +129,47 @@ function createDecorated(original, options, U, grid) {
           : original[key];
   }
   m.userData.alphaCutoff = m.alphaTest;
-  if(m.map && m.alphaTest > 0) {
+  if (m.map && m.alphaTest > 0) {
     m.maskNode = N.texture(m.map).a.greaterThan(N.float(m.alphaTest));
     m.alphaToCoverage = true;
   }
   m.userData.shading = { wind, ground, transmission, grass };
+  m.userData.grassAtlas = grassAtlas;
   if (wind)
     m.positionNode = N.Fn((builder) => {
       const id = builder.object.isInstancedMesh
         ? N.float(N.instanceIndex)
         : N.float(0);
-      return K.windPosition({p:N.positionLocal,t:ref(U,'time'),id,
-        y:N.positionGeometry.y,v:N.uv().y,strength:N.float(wind)});
+      const anchor = builder.object.isInstancedMesh
+        ? N.modelWorldMatrix.mul(instanceMatrix().element(3)).xyz
+        : N.modelWorldMatrix.element(3).xyz;
+      return K.windPosition({
+        p: N.positionLocal,
+        t: ref(U, "time"),
+        id,
+        anchor,
+        y: N.positionGeometry.y,
+        v: N.uv().y,
+        strength: N.float(wind),
+      });
     })();
+  let groundFade = N.float(0);
   let base = N.materialColor;
   if (ground) {
     const p = N.positionWorld,
       land = terrainNode(U.terrainField.value, p.xz, grid),
-      guv = p.xz.mul(0.8);
+      guv = p.xz.mul(0.72);
     const soil = N.texture(m.map, guv).setUpdateMatrix(false).rgb,
-      lush = texRef(U, "groundMap").sample(guv.mul(0.9)).setUpdateMatrix(false).rgb,
-      dry = texRef(U, "dryGroundMap").sample(guv.mul(0.9)).setUpdateMatrix(false).rgb;
+      lush = N.mix(
+        texRef(U, "groundMap").sample(guv).setUpdateMatrix(false).rgb,
+        texRef(U, "groundMap")
+          .sample(N.vec2(guv.y.negate(), guv.x).mul(0.73).add(17.31))
+          .setUpdateMatrix(false).rgb,
+        0.3,
+      ),
+      // The baked dry habitat carries its actual seed-grass textures. Reuse
+      // the fine ground detail underneath it to stay within 16 GPU samplers.
+      dry = lush.mul(N.vec3(1.12, 0.94, 0.78));
 
     const root = texRef(U, "rootField").sample(
       p.xz
@@ -133,18 +179,88 @@ function createDecorated(original, options, U, grid) {
         .add(0.5)
         .div(grid),
     ).r;
-    const stone = texRef(U,"rockMap").sample(guv.mul(.5)).setUpdateMatrix(false).rgb;
-    const cover = texRef(U,"grassGround").sample(p.xz.add(2000).div(4000));
-    m.colorNode = K.groundBlend({p,camera:N.cameraPosition,land,soil,lush,dry,stone,root,cover});
+    const stone = texRef(U, "rockMap")
+      .sample(guv.mul(0.5))
+      .setUpdateMatrix(false).rgb;
+    const cover = texRef(U, "grassGround").sample(p.xz.add(2000).div(4000));
+    const habitat = texRef(U, "grassHabitat").sample(
+      p.xz.add(2000).div(4000),
+    ).rgb;
+    const tiled = N.fract(N.vec2(p.x, p.z.negate()).div(4));
+    // Half a texel of inset isolates habitats in every generated mip level.
+    const patchUV = (k) =>
+      N.vec2(
+        tiled.x
+          .mul(1 - 2 / 512)
+          .add(1 / 512 + k)
+          .div(3),
+        tiled.y.mul(1 - 2 / 512).add(1 / 512),
+      );
+    let surface = N.vec3(0),
+      mean = N.vec3(0),
+      normal = N.vec3(0);
+    for (let k = 0; k < 3; k++) {
+      const weight = habitat.element(k),
+        map = texRef(U, "grassSurface");
+      surface = surface.add(
+        map.sample(patchUV(k)).setUpdateMatrix(false).rgb.mul(weight),
+      );
+      mean = mean.add(
+        map
+          .sample(N.vec2((k + 0.5) / 3, 0.5))
+          .level(9)
+          .rgb.mul(weight),
+      );
+      normal = normal.add(
+        texRef(U, "grassSurfaceNormal")
+          .sample(patchUV(k))
+          .rgb.mul(2)
+          .sub(1)
+          .mul(weight),
+      );
+    }
+    const block = N.floor(p.xz.add(2000).div(24)).mul(24).sub(1988);
+    groundFade = N.smoothstep(
+      55,
+      166,
+      N.distance(N.cameraPosition, N.vec3(block.x, land.r, block.y)),
+    );
+    m.colorNode = K.groundBlend({
+      p,
+      camera: N.cameraPosition,
+      land,
+      soil,
+      lush,
+      dry,
+      stone,
+      root,
+      cover,
+      surface,
+      mean,
+    });
     m.normalNode = N.normalMap(
       N.texture(m.normalMap, guv).setUpdateMatrix(false),
       N.vec2(m.normalScale.x, m.normalScale.y),
     );
+    const canopy = normal.normalize();
+    const canopyView = N.cameraViewMatrix
+      .mul(N.vec4(canopy, 0))
+      .xyz.normalize();
+    m.normalNode = N.normalize(
+      N.mix(m.normalNode, canopyView, groundFade.mul(cover.a).mul(0.85)),
+    );
     base = m.colorNode;
   }
   if (grass) {
-    const detail = N.texture(m.normalMap).xyz.mul(2).sub(1);
-    const wn = K.grassNormal({detail,yaw:yawNode()});
+    const uv = grassAtlas ? grassAtlasUV(grassAtlas) : N.uv();
+    if (grassAtlas) {
+      const tex = N.texture(m.map, uv);
+      m.colorNode = tex.rgb;
+      m.opacityNode = tex.a;
+      m.maskNode = tex.a.greaterThan(m.alphaTest);
+    }
+    const detail = N.texture(m.normalMap, uv).xyz.mul(2).sub(1);
+    const wn = K.grassNormal({ detail, yaw: yawNode() });
     m.normalNode = N.normalize(N.cameraViewMatrix.mul(N.vec4(wn, 0)).xyz);
   }
   const bake = (p) => sampleVolume(U, "bakedAtlas", p, [0.12, 0.16, 0.2, 1]);
@@ -157,13 +273,28 @@ function createDecorated(original, options, U, grid) {
     .rgb.mul(2)
     .sub(1)
     .normalize();
-  const indirect = bake(N.positionWorld.add(N.normalWorld.mul(grass ? .15 : 1.1))).rgb;
-  const thin = transmission || (grass ? .18 : wind > 0 ? .32 : 0);
-  const extra = K.foliageRadiance({n:N.normalWorld,indirect,bent,
-    enabled:ref(U,'bakedEnabled'),sun:ref(U,'liveSunDirection','vec3'),
-    visibility:bake(N.positionWorld).a.mul(N.float(1).sub(cloudAt(U,N.positionWorld,ref(U,"liveSunDirection","vec3")).mul(.48))),
-    lamp:ref(U,'liveLampPosition','vec3').sub(N.positionWorld),
-    power:ref(U,'liveLampPower'),thin:N.float(thin),daylight:ref(U,"daylight")});
+  const indirect = bake(
+    N.positionWorld.add(N.normalWorld.mul(grass ? 0.15 : 1.1)),
+  ).rgb;
+  const thin = transmission || (grass ? 0.26 : wind > 0 ? 0.32 : 0);
+  const extra = K.foliageRadiance({
+    n: N.normalWorld,
+    indirect,
+    bent,
+    enabled: ref(U, "bakedEnabled"),
+    sun: ref(U, "liveSunDirection", "vec3"),
+    visibility: bake(N.positionWorld).a.mul(
+      N.float(1).sub(
+        cloudAt(U, N.positionWorld, ref(U, "liveSunDirection", "vec3")).mul(
+          CLOUD_SHADOW_STRENGTH,
+        ),
+      ),
+    ),
+    lamp: ref(U, "liveLampPosition", "vec3").sub(N.positionWorld),
+    power: ref(U, "liveLampPower"),
+    thin: ground ? groundFade.mul(0.26) : N.float(thin),
+    daylight: ref(U, "daylight"),
+  });
   m.emissiveNode = N.diffuseColor.rgb.mul(extra);
   return fade ? fadeTSL(m) : m;
 }
@@ -187,14 +318,34 @@ export function billboardTSL(m, atlas, merged = false) {
     N.cameraPosition.x.sub(data.x),
     N.cameraPosition.z.sub(data.z),
   );
-  const atlasUV = N.varying(K.atlasUV({uv:N.uv(),angle,yaw:data.w,
-    views:N.float(count),row:merged ? N.attribute('plantInfo','vec2').y : N.float(0),rows:N.float(rows)}));
+  const atlasUV = N.varying(
+    K.atlasUV({
+      uv: N.uv(),
+      angle,
+      yaw: data.w,
+      views: N.float(count),
+      row: merged ? N.attribute("plantInfo", "vec2").y : N.float(0),
+      rows: N.float(rows),
+    }),
+  );
   m.positionNode = N.Fn(() => {
     const p = N.positionGeometry;
+    // Keep roots fixed while the last geometric meadow layer settles into its
+    // matching canopy surface. This avoids a ring of tall, repeated patch cards.
+    const compression = atlas.grassPatch
+      ? N.float(1).sub(
+          N.smoothstep(82, 166, N.distance(N.cameraPosition, data.xyz)).mul(
+            0.78,
+          ),
+        )
+      : N.float(1);
+    const y = p.y
+      .add(atlas.grassPatch ? atlas.centerY : 0)
+      .mul(compression)
+      .sub(atlas.grassPatch ? atlas.centerY : 0);
     if (merged) return data.xyz.add(rotate(N.vec3(p.x, p.y, 0), angle));
     const mat = instanceMatrix();
-    return mat.mul(N.vec4(rotate(N.vec3(p.x, p.y, 0), angle.sub(data.w)), 1))
-      .xyz;
+    return mat.mul(N.vec4(rotate(N.vec3(p.x, y, 0), angle.sub(data.w)), 1)).xyz;
   })();
   const map = N.texture(m.map, atlasUV);
   m.colorNode = map.rgb;

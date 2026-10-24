@@ -7,6 +7,8 @@
     "test": "node scripts/verify.mjs",
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
+    "build:pages": "vite build --base /BakedVoxelLighting/",
+    "preview": "vite preview --host 127.0.0.1",
     "test:merged": "node scripts/verify-merged.mjs",
     "test:landscape": "node scripts/landscape-data.mjs",
     "test:frames": "node scripts/verify-frame-clock.mjs && node scripts/verify-frame-browser.mjs",
@@ -18,7 +20,7 @@
   "license": "MIT",
   "type": "module",
   "dependencies": {
-    "three": "^0.186.1"
+    "three": "0.186.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.64.1",
@@ -32,5 +34,5 @@
   "bugs": {
     "url": "https://github.com/SamG-Coder/BakedVoxelLighting/issues"
   },
-  "homepage": "https://github.com/SamG-Coder/BakedVoxelLighting#readme"
+  "homepage": "https://samg-coder.github.io/BakedVoxelLighting/"
 }

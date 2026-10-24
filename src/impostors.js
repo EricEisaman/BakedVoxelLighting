@@ -1,7 +1,7 @@
-import {prepareAtlasMips} from "./atlas-mips.js";
+import { prepareAtlasMips } from "./atlas-mips.js";
 import * as N from "three/tsl";
 import { readPixels } from "./tsl-baking.js";
-import { billboardTSL } from "./tsl-materials.js";
+import { billboardTSL, grassAtlasUV } from "./tsl-materials.js";
 import * as T from "three/webgpu";
 import { decorate, fadeMaterial } from "./lighting.js";
 export async function captureSurface(
@@ -14,6 +14,7 @@ export async function captureSurface(
   views,
   cache,
   key,
+  options = {},
 ) {
   let record = await cache.get(key);
   if (!record) {
@@ -56,9 +57,16 @@ export async function captureSurface(
             m.alphaTest = original.alphaTest;
             m.side = original.side;
             m.toneMapped = false;
-            const alpha = original.map ? N.texture(original.map).a : N.float(1);
+            const sourceUV = original.userData.grassAtlas
+              ? grassAtlasUV(original.userData.grassAtlas)
+              : N.uv();
+            const alpha = original.map
+              ? N.texture(original.map, sourceUV).a
+              : N.float(1);
             const colour = original.map
-              ? N.texture(original.map).rgb.mul(N.vec3(original.color.r, original.color.g, original.color.b))
+              ? N.texture(original.map, sourceUV).rgb.mul(
+                  N.vec3(original.color.r, original.color.g, original.color.b),
+                )
               : N.vec3(original.color.r, original.color.g, original.color.b);
             // Reuse represented grass normals and curved leaf normals during capture.
             const viewNormal =
@@ -74,12 +82,17 @@ export async function captureSurface(
               .xyz.normalize();
             if (pass === 0) {
               m.fragmentNode = N.Fn(() => {
-                N.If(alpha.lessThanEqual(original.alphaTest || 0), () => N.Discard());
+                N.If(alpha.lessThanEqual(original.alphaTest || 0), () =>
+                  N.Discard(),
+                );
                 let rgb = colour;
-                if (original.vertexColors && mesh.geometry.hasAttribute('color'))
-                  rgb = rgb.mul(N.attribute('color','vec3'));
+                if (
+                  original.vertexColors &&
+                  mesh.geometry.hasAttribute("color")
+                )
+                  rgb = rgb.mul(N.attribute("color", "vec3"));
                 if (mesh.instanceColor) rgb = rgb.mul(N.instanceColor.rgb);
-                return N.vec4(rgb, alpha);
+                return N.vec4(rgb, options.topDown ? 1 : alpha);
               })();
             } else {
               // Normals are data: instance/vertex tint must never multiply them.
@@ -87,7 +100,10 @@ export async function captureSurface(
                 N.If(alpha.lessThanEqual(original.alphaTest || 0), () => {
                   N.Discard();
                 });
-                return N.vec4(worldNormal.mul(0.5).add(0.5), alpha);
+                return N.vec4(
+                  worldNormal.mul(0.5).add(0.5),
+                  options.topDown ? 1 : alpha,
+                );
               })();
             }
             materials.set(original, m);
@@ -103,11 +119,15 @@ export async function captureSurface(
         target.scissorTest = true;
         for (let i = 0; i < views; i++) {
           const a = (i / views) * Math.PI * 2;
-          camera.position.set(
-            center.x + Math.sin(a) * 800,
-            center.y,
-            center.z + Math.cos(a) * 800,
-          );
+          if (options.topDown) {
+            camera.up.set(0, 0, -1);
+            camera.position.copy(center).add(new T.Vector3(0, 800, 0));
+          } else
+            camera.position.set(
+              center.x + Math.sin(a) * 800,
+              center.y,
+              center.z + Math.cos(a) * 800,
+            );
           camera.lookAt(center);
           target.viewport.set(i * size, 0, size, size);
           target.scissor.set(i * size, 0, size, size);
@@ -126,6 +146,10 @@ export async function captureSurface(
         views,
         width,
         height,
+        topDown: !!options.topDown,
+        grassPatch: !!options.grassPatch,
+        centerY: center.y,
+        cutoff: options.topDown ? 0 : 82,
       };
       record.mips = await prepareAtlasMips(record);
       await cache.put(key, record);
@@ -164,7 +188,11 @@ export async function captureSurface(
     t.magFilter = T.LinearFilter;
     t.minFilter = T.LinearMipmapLinearFilter;
     t.generateMipmaps = false;
-    t.mipmaps = record.mips.map(level => ({data:t===texture ? level.data : level.normals,width:level.width,height:level.height}));
+    t.mipmaps = record.mips.map((level) => ({
+      data: t === texture ? level.data : level.normals,
+      width: level.width,
+      height: level.height,
+    }));
     t.needsUpdate = true;
   }
   texture.colorSpace = T.LinearSRGBColorSpace;
@@ -212,4 +240,3 @@ export function surfaceBillboards(atlas, transforms, transmission = 0.32) {
     transforms,
   );
 }
-

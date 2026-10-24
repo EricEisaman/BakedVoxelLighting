@@ -2,6 +2,14 @@
 
 A desktop Three.js woodland prototype with browser GPU baking, IndexedDB persistence, live lighting updates, and four tree and grass distance levels.
 
+**[Try the live world](https://samg-coder.github.io/BakedVoxelLighting/)** · [Source on GitHub](https://github.com/SamG-Coder/BakedVoxelLighting) · [Deployment status](https://github.com/SamG-Coder/BakedVoxelLighting/actions/workflows/pages.yml)
+
+Use a desktop browser with hardware acceleration enabled. The first visit downloads
+the textures and bakes the world on your GPU; leave the tab open until the Bake
+Studio says ready. Later visits reuse bakes from IndexedDB. WebGPU is selected
+when available; WebGL2 is also available in the graphics backend selector. This
+is an experimental desktop demo, and initial loading and streaming can take time.
+
 ## Run
 
 ```powershell
@@ -11,22 +19,60 @@ npm ci
 npm run dev -- --port 5173
 ```
 
-Open http://127.0.0.1:5173. Drag to orbit; scroll to travel. Explore world enables mouse look and WASD, with Shift for faster walking and Escape to release the pointer. Next viewpoint cycles cameras. Tree and grass controls can force levels for inspection. The sun slider updates lighting; the moving-light checkbox animates a point light. Bake & cache world saves the current sun/volume configuration. Clear cache removes this application's stored bakes.
+Open http://127.0.0.1:5173. Drag to orbit; scroll to travel. Explore world enables mouse look and WASD, with Shift for faster walking and Escape to release the pointer. Next viewpoint cycles cameras. The landing-page dark gradient is removed while exploring so the scene lighting remains visible. Tree and grass controls can force levels for inspection. The sun slider updates lighting; the moving-light checkbox animates a point light. Bake & cache world saves the current sun/volume configuration. Clear cache removes this application's stored bakes.
 
 ## World and vegetation
 
-The deterministic 4,000 x 4,000 m world (16 km²) uses a 2001-square terrain grid, 42,000 erosion droplets, sediment deposition, thermal relaxation, and slope-aware routes. Moisture, slope and foot traffic drive meadow, dry grass, rock and soil blending. It contains 37,751 trees in 1,024 spatial batches, nine tree prototypes across oak/birch/ash, multi-stem shrubs, clustered rocks, and 27,556 grass patch locations. Nearby grass geometry is generated lazily and released beyond the active region.
+The deterministic 4,000 x 4,000 m world (16 km²) uses a 2001-square terrain grid, 42,000 erosion droplets, sediment deposition, thermal relaxation, and slope-aware routes. Moisture, slope and foot traffic drive meadow, dry grass, rock and soil blending. It contains 38,041 trees in 1,024 spatial batches, twelve tree prototypes across oak/birch/ash/pine, distinct hazel/bramble/elder shrubs, clustered rocks, and 27,556 grass patch locations. Nearby grass geometry is generated lazily and released beyond the active region.
 
 Trees use continuous tapered branch tubes with child forks embedded into parent wood. Roots flare into the ground. A shared irregular root field scales with tree size, raises the soil by up to 12 cm, blends exposed soil into surrounding grass and suppresses grass placements, including grass impostors. Ground and grass use the same field so a soil patch is not covered by the old grass distribution. This is an artistic root-zone approximation, not a biological root simulation.
 
 | Level | Trees | Grass |
 |---|---|---|
-| L0 | Below 85 m: detailed branch tubes and foliage cards | Below 34 m: mixed crossed foliage cards |
-| L1 | 85-190 m: fewer branch ring sides, same branch skeleton and foliage positions | 34-70 m: reduced clump density |
-| L2 | 190-420 m: simplified actual branches plus 16-view canopy captures from the high-detail source | 70-135 m: three shared 8-view patch captures |
-| L3 | Beyond 420 m: 8-view full-tree captures, each anchored at its original terrain position | Beyond 135 m: terrain meadow coverage |
+| L0 | Below 85 m: detailed branch tubes and foliage cards | Below 38 m: seven grass/flower types in one atlas batch |
+| L1 | 85-190 m: fewer branch ring sides, same branch skeleton and foliage positions | 38-82 m: reduced density of the same source population |
+| L2 | 190-420 m: simplified actual branches plus 16-view canopy captures from the high-detail source | 82-155 m: three shared 8-view patch captures |
+| L3 | Beyond 420 m: 8-view full-tree captures, each anchored at its original terrain position | Beyond 155 m: baked grass canopy colour and normals blended into terrain |
 
 Distances use spatial batch centres. Complementary screen-door fades overlap adjacent levels over 14/26/45 m for trees and 8/13/22 m for grass. Far trees are batched spatially but retain their individual transforms: rotating a whole cluster billboard would incorrectly shift their ground contacts on slopes. Atlas minification uses mip filtering. Rendering uses 4-sample multisampling where supported. There is no fog.
+
+## Layered meadow and connected plant growth
+
+Seven grass and flower types have different widths and heights, from short clover
+through long curved blades and tall seed heads, with yellow/white and purple flower
+patches. Habitat fields control their mixtures, colour, density and wind direction.
+The deterministic test samples heights from about 0.16 to 1.82 m. Close grass uses
+bent crossed cards with camera-independent lighting normals. One shared atlas
+keeps each near grass block to one material batch.
+
+Oak has spreading limbs, birch a slender leader and drooping ends, ash opposing
+branching, and pine whorled boughs. Tapered secondary and terminal branches attach
+along their parent paths; foliage attaches along twigs. Three age groups share
+those rules. Hazel grows from multiple basal stems, bramble spreads along low
+arching canes, and elder forms a denser multi-stem shrub. They have their own
+source geometry and far captures rather than using scaled-down tree prototypes.
+
+The distant meadow blends three seamless four-metre canopy tiles into terrain.
+Each 512-square colour/normal tile is rendered from the same grass cards, with
+wrapped edge copies and ground beneath. A 1024-square habitat/coverage field
+selects the mixtures and source mip averages maintain colour at distance.
+Explicit mipmaps retain detail and normals through minification. Last-level
+patches settle toward the ground as the terrain blend takes over. Tree roots,
+roads, water and rock exclusions still affect both placements and terrain.
+
+The live texture binding was also corrected: sampled node clones previously
+retained the grey placeholder after a bake replaced the texture. A GPU regression
+check swaps a sampled texture after its first draw and verifies the new pixel.
+
+Local checks: `node scripts/verify-vegetation-data.mjs` validates connected tapered
+branches, distinct growth forms and deterministic grass mixtures. With Vite
+running, `node scripts/verify-meadow-clouds.mjs webgpu` (or `webgl2`) checks the
+live binding, canopy tile coverage/detail, mip chains and cloud bake reuse,
+then captures close/distant meadow and sky views. `verify-cloud-volume.mjs` checks
+packed-height continuity and compares a complete sky bake against the incremental
+update; both backends produced identical pixels in that check. Performance remains dependent
+on visible geometry, shader preparation and streaming; these checks do not certify
+180 Hz presentation or photographic fidelity.
 
 ## Lighting and persistence
 
@@ -34,11 +80,11 @@ Three.js manages scene objects, instancing and rendering. Direct GLSL/WGSL rende
 
 Live materials sample RGB indirect light and scalar sun visibility. Direct point lights and shadows update each frame; the moving light refreshes the GPU volume about every 180 ms. Grass and leaves include an approximate thin-leaf backlighting contribution. Tree and grass captures store unlit colour and normals and are relit at runtime. This avoids rebaking their colour atlases whenever the sun moves.
 
-Initial GPU results are read asynchronously and stored in IndexedDB. SHA-256 identities include texture contents and relevant generator/shader sources. Live light updates stay on the GPU and do not add cache entries per frame. A cold default bake creates 51 main-cache records: 13 source mip chains, 13 normal maps, occupancy, static transport, live lighting, 18 tree colour/normal atlases, 3 grass atlases and a statistical far-grass ground-coverage map. Origin, settings or source changes invalidate relevant entries. Old configurations remain until cleared; automatic eviction is not implemented.
+Initial GPU results are read asynchronously and stored in IndexedDB. SHA-256 identities include texture contents and relevant generator/shader sources. Live light updates stay on the GPU and do not add cache entries per frame. A cold default bake creates 82 main-cache records: 21 source mip chains, 21 normal maps, the packed grass atlas, occupancy/transport/radiance, 24 tree atlases, 3 grass atlases, 3 shrub atlases, 3 canopy captures plus their combined ground atlas, a habitat/coverage field, and cloud density. Origin, settings or source changes invalidate relevant entries. Old configurations remain until cleared; automatic eviction is not implemented.
 
 ## Assets
 
-There are 13 generated base-colour PNGs in public/textures: three barks, three tree foliage materials, meadow grass, seedhead grass, clover, dirt, rock, dry meadow ground and lush meadow ground. Source images are actually **1254 x 1254**, despite 2048 being requested. Matching exported normal PNGs are browser GPU finite differences of source luminance, not scanned high-poly normals. Texture tiling is not guaranteed mathematically seamless.
+There are 21 generated base-colour PNGs in public/textures. The latest eight add long meadow grass, mature seed grass, yellow/white flowers, purple flowers, hazel, bramble, pine and fine meadow ground. Prompts and saved filenames are recorded in [docs/vegetation-texture-prompts.md](docs/vegetation-texture-prompts.md). Source images are actually **1254 x 1254**, despite 2048 being requested. Normal maps are browser GPU finite differences of source luminance, not scanned high-poly normals. Texture tiling is not guaranteed mathematically seamless.
 
 ## Reference
 
@@ -59,7 +105,7 @@ The river has one continuous meandering channel and a monotonically descending w
 
 Terrain is divided into 1,024 tiles, each with 48, 12 and 4 subdivisions per side. Distance chooses the mesh at 260 and 850 m. All levels sample the same eroded and river-carved height data; vertical skirts conceal resolution joins. River-intersecting tiles retain fine subdivisions at distance so the narrow channel does not disappear in coarse triangles. The camera can see across the full map without fog. Terrain changes levels discretely; vegetation retains its existing fades. No invented mountains are added beyond the 4 km boundary.
 
-Dirt repeats at 1.25 m, meadow at approximately 1.39 m, and rock at 2.5 m, independently of map size. Ground normal sampling also uses world coordinates. Nearby grass candidate density increased from 1,050 to 2,600 per patch, with traffic, water and root exclusions retained. Far grass uses 110 candidate patch impostors instead of 55. Forest cores are denser while exposed uplands remain more open.
+Dirt repeats at 1.25 m, meadow at approximately 1.39 m, and rock at 2.5 m, independently of map size. Ground normal sampling also uses world coordinates. Nearby grass uses 3,900 candidate roots per 24 m patch, with traffic, water and root exclusions retained. Far grass uses 190 candidate patch impostors. Forest cores are denser while exposed uplands remain more open.
 
 Research informing the spatial rules: [US Forest Service: individuals, clumps and openings](https://research.fs.usda.gov/treesearch/54887) and [National Park Service: soils and moisture in riparian communities](https://www.nps.gov/pohe/learn/nature/gorge-riparian-comm.htm). These sources describe particular ecosystems; their exact species or densities are not presented as universal targets for this woodland.
 
@@ -71,7 +117,7 @@ Frustum culling uses Three.js mesh bounding volumes. Terrain is culled per tile 
 
 ## Visibility-triggered merged mesh baking
 
-Far-tree L3 batches now merge all nine prototype variants into one indexed mesh per spatial cluster. A shared colour/normal atlas packs the source prototype captures into nine rows. Every tree keeps its own centre, yaw, scale and camera-facing quad; this is merged geometry, not one flat image of a whole forest. Nearer tree levels keep their existing meshes and transitions.
+Far-tree L3 batches now merge all twelve prototype variants into one indexed mesh per spatial cluster. A shared colour/normal atlas packs the source prototype captures into twelve rows. Every tree keeps its own centre, yaw, scale and camera-facing quad; this is merged geometry, not one flat image of a whole forest. Nearer tree levels keep their existing meshes and transitions.
 
 At startup, active far-distance clusters are prepared around the camera in all directions, preventing a turn from revealing hundreds of unprepared draws. Subsequent updates queue clusters whose far level is active and whose conservative bounds intersect the camera frustum. The nearest eligible cluster is processed first, with at most one asynchronous cache/bake job in flight. Existing L3 geometry stays in place until replacement is ready. Camera turns can request new clusters; previously invisible geometry is not permanently discarded. Frustum checks include an allowance for shader-rotated quad corners.
 
@@ -133,18 +179,17 @@ and the 256 m local volume. Volume boundaries blend over 24 m horizontally and
 6 m vertically. Recenter requests begin 64 m from the current requested centre.
 Fast travel can still outrun asynchronous bake completion.
 
-Grass placement uses 3,400 candidates per near block, with darker/shorter coherent
+Grass placement uses 3,900 candidates per near block, with darker/shorter coherent
 patches and a varying preferred growth direction. The worker and bake-source
-placement use the same changes. The existing meadow, seedhead and clover assets
-remain in use; no additional texture species were generated in this change.
-Oak, birch and ash now also form coherent groves in the open-land selection.
+placement use the same changes. Seven grass and flower textures share a packed
+source atlas. Oak, birch, ash and pine form coherent groves in the open-land selection.
 
 Validation: `node scripts/verify-sun.mjs` checks multi-block grass and shared sun
 parameters and captures `evidence/visible-sun.png`. Backend verification checks
 cutout thresholds, atlas mipmaps, live relighting and cache reuse. Headless timing
 does not certify smooth 180 Hz presentation on a physical display.
-Cloud-field generation is an explicit 10 Hz GPU pass. Materials sample its
-shared texture; they do not carry their own procedural-noise or RTT dependency.
+Cloud density is generated once and cached. Materials sample a shared shadow
+texture; they do not carry their own procedural-noise or RTT dependency.
 Observed movement limitation: the final profiled WebGPU traversal kept 257 frames
 flowing through a roughly 7.2-second volume rebuild, but its worst interval was
 about 500 ms. The two camera sweeps had 95th-percentile intervals of about 83 and
@@ -160,7 +205,7 @@ settled-view check reached 60 FPS; these are different acceptance boundaries.
 - The static world fingerprint is hashed once, rather than serializing all trees
   on every streamed-volume request.
 - All three rendered grass LOD placements are worker-generated and persisted in
-  `BakedGrassBlocks-v1`, addressed by source identity, block coordinates, seed and
+  `BakedGrassBlocks-v2`, addressed by source identity, block coordinates, seed and
   LOD. A bounded 96-entry resident cache avoids repeated database reads. Voxel
   grass uses the same cached high-detail placement. The project-cache button
   clears this database too. First visits still require missing blocks to bake.
@@ -171,10 +216,13 @@ settled-view check reached 60 FPS; these are different acceptance boundaries.
   and transmission strength as near grass; the ground-cover colour comes from
   source mip averages with the matching tint. Mipmaps cannot remove differences
   caused by geometry silhouettes or local lighting coverage.
-- The cloud stripe bug was a native-function entry-point error: the wrapper had
-  selected a hash helper instead of the 2D density function. The replacement has
-  one entry point. The 1024-square cloud density/mip field bakes once; runtime
-  movement samples translated UVs. This supersedes the earlier 10 Hz noise bake.
+- Clouds use a GPU-baked 256 x 48 x 256 density volume with periodic three-dimensional
+  lobes and edge erosion. The same field produces sunlight visibility and the sky.
+  Density persists in IndexedDB. Sun-dependent lighting, a 512-square ground-shadow
+  field and a 2048 x 1024 sky view update in 64-row GPU slices; complete sky/shadow
+  buffers swap together. Camera rotation does not trigger a bake; periodic sky updates continue.
+  Shadow attenuation is capped at 22 percent, replacing the previous 48 percent.
+  This is a bounded single-scattering approximation, not a full weather simulation.
 - One real second advances one world minute. A full cycle is 1,440 real seconds
   (24 minutes). The time slider scrubs time, the checkbox pauses/resumes, and
   **Look at sun** aims toward the daytime sun. Sun intensity, ambient light,
@@ -185,7 +233,7 @@ Checks: `verify-area-cycle.mjs` compares indexed queries to exhaustive bounds
 checks and verifies clock arithmetic; `verify-mip-colour.mjs` checks linear-light
 averaging, transparent-pixel rejection and atlas-view isolation;
 `verify-cycle-browser.mjs` checks daytime/nighttime, clock progression and cloud
-variation on both axes. Backend checks now expect 51 reusable main-cache bakes.
+variation on both axes. Backend checks validate 30 relightable plant atlases and reuse the main-cache bakes.
 Static lookup work is reduced; GPU draw submission, visibility decisions, dynamic
 lighting and first-use shader preparation remain runtime work.
 Voxel-volume origins now use a 64 m horizontal area address and an 8 m quantized
@@ -199,12 +247,170 @@ results do not establish hitch-free movement; shader preparation and draw/scene
 work remain costs beyond the static-data bake changes.
 
 
+## Worker preparation and first-use rendering
+
+Missing area data is now prepared off the animation thread:
+
+- The grass worker receives a small copy of the addressed heightfield/root grid.
+  Interpolation, habitat noise, plant placement, and cache access run in the worker.
+- A dedicated voxel worker builds grass, branch, leaf, shrub, rock and water
+  occupancy, packs material masks, and reorders GPU readback. Area indexes select
+  the overlapping entries before dispatch; the worker does not regenerate the
+  full terrain. Completed typed-array buffers are transferred back, not cloned.
+- A separate forest worker creates and caches merged far-tree meshes. The
+  existing HLOD remains visible until its replacement is compiled and ready.
+- GPU resource and shader preparation uses a serialized queue outside the frame
+  update. During exploration, a new preparation item starts after a presented
+  frame. Three's async compiler yields between shader stages; this remaining
+  renderer-owned work is still on the main thread, not a Web Worker.
+- Stable minimal sun-shadow materials retain the same alpha masks, fade, wind
+  positions and shadow sides without reconstructing a shared override shader
+  on first encounter. The colour and shadow paths are prepared before publishing
+  new tree LODs. An isolated cutout/wind comparison matches the original shadow
+  image byte-for-byte on both APIs.
+- Three r186.1's async compilation uses a depth-zero render context, while this
+  app's nested world and shadow passes use depths one and two. The preparation
+  wrapper captures the matching context synchronously and immediately restores
+  renderer state before awaiting compilation. No files in node_modules are
+  patched. Recheck this compatibility wrapper when upgrading Three.
+- Turning in place reuses distance-LOD decisions (with a 1 mm movement tolerance
+  for floating-point drift). Frustum culling and drawing continue every frame.
+  Completed jobs invalidate those decisions. Released grass generations reject
+  stale results without clearing a newer request's pending flag.
+- The old voxel volume, direction map and origin stay together until the new
+  volume is prepared, preventing partially published lighting during streaming.
+
+Local checks (not GitHub Actions):
+
+`node scripts/verify-preparation-workers.mjs` checks byte-identical worker voxel
+colour/opacity and material masks, transferred ownership, merged cache reuse,
+worker error rejection, and continued animation during worker execution.
+`node scripts/verify-prepared-shadows.mjs` compares original/prepared shadow
+cutouts and displaced geometry on both backends.
+`node scripts/verify-streaming-preparation.mjs webgpu` (or `webgl2`) rotates
+in place, checks worker counters and unexpected synchronous shader builds, then
+moves to a new area and verifies that the old lighting remains valid while baking.
+
+## Paged GPU uploads
+
+Prepared data now follows a separate residency stage:
+
+`area index / cache -> worker buffers -> upload pages -> complete submission -> LOD / lighting swap`
+
+`src/gpu-upload-queue.js` shares credits across every resource on a renderer.
+Copies run in tasks after animation callbacks, with the following limits:
+
+| Limit | Exploring | Loading screen |
+| --- | ---: | ---: |
+| Maximum transfer page | 64 KiB | 64 KiB |
+| Upload bytes per animation frame | 256 KiB | 4 MiB |
+| CPU submission time target per frame | 1 ms | 4 ms |
+| Maximum submitted bytes awaiting completion | 512 KiB | 8 MiB |
+
+The byte limits are hard limits for managed transfers; the CPU target is checked
+between pages and cannot interrupt a driver call. Completing one resource does
+not reset the frame budget. A lightweight frame clock replenishes credits; it
+does not render a second scene or cap the application's refresh rate.
+
+`src/gpu-uploads.js` allocates Three-compatible resources, then uploads buffer
+ranges and texture rows/tiles instead of copying an entire worker result at once.
+It handles 2D textures, voxel volumes, explicit atlas mip chains, vertex/index
+buffers and instance attributes discovered by shader compilation. WebGPU uses
+queue writes. WebGL2 uses sub-data/sub-image copies. Both use asynchronous fences
+to bound the staging backlog, without a synchronous `finish()`. Once all pages
+are submitted, later draws are safe by GPU command ordering. There is no CPU
+fence wait per resource; that would serialize startup around driver completion
+notifications even when the upload itself is small.
+
+Tree, merged-forest, grass, shrub and terrain replacements stay behind the
+preparation gate until all their copies are queued and pipelines are ready. Existing LODs remain
+visible. Voxel direction maps and cached radiance are resident before publication,
+so texture data and volume coordinates switch together. Disposal cancels pending
+copies and releases the corresponding tracked allocation.
+
+These are **transfer pages**, not sparse virtual textures or a GPU heap allocator.
+The complete destination buffer/texture is still allocated. Native image uploads
+during initial baking, render-target allocation, shader construction/compilation,
+uniform updates and GPU rendering remain outside the transfer budget. The existing
+grass residency policy still controls eviction. Three is pinned to **0.186.1**;
+the adapter uses backend internals and must be revalidated before upgrading.
+
+Diagnostics: `worldDiagnostics.preparation.uploads` reports pending and in-flight
+bytes, submitted pages, frame maxima, cancellation, estimated allocated bytes for
+managed resources, allocation timing and uploads outside this path. Allocated
+bytes are not a measurement of the device's complete VRAM usage.
+
+Local checks, with no Actions workflow:
+
+- `node scripts/verify-gpu-pages.mjs`: real WebGPU/WebGL2 transfers, byte-exact
+  geometry, explicit mip and volume comparisons, duplicate requests, frame byte
+  limits, GPU backlog, cancellation and disposal. Explicit baked mips match the
+  native uploads exactly. WebGL2 automatic mip generation in the test differs
+  by at most 2/255 in a channel; base pixels and supplied mips remain identical.
+- `node scripts/verify-streaming-preparation.mjs webgpu paged-streaming` (or
+  `webgl2`): full-world rotation and travel, unchanged uploads when turning,
+  page/backlog limits during streaming, and no new bulk uploads bypassing the
+  queue. Evidence is written under `evidence/paged-streaming-<backend>.*`.
+- `node scripts/verify-terrain-faces.mjs`: front-face culling and camera clearance,
+  including a teleport onto a still-visible four-subdivision terrain fallback
+  while the detailed tile is being prepared.
+
+Measured locally in headless Edge at 1280 x 800 after paging and LOD gating:
+
+| Measurement | WebGPU | WebGL2 |
+| --- | ---: | ---: |
+| Rotation p95 frame interval (both sweeps) | 16.8 ms | 33.4 ms |
+| New-area voxel rebuild elapsed | 6.43 s | 8.07 s |
+| Worst interval during that rebuild | 50.0 ms | 100.1 ms |
+| Maximum managed upload submission time per exploration frame | 0.3 ms | 0.2 ms |
+| New bulk uploads bypassing paging during the test | 0 | 0 |
+
+Both backends retained the previous lighting and recorded no shader/console
+errors. Rotation issued no new uploads. Bounded uploads intentionally spread
+resource availability over multiple frames; LOD shader preparation can continue
+after the voxel rebuild completes, so these are not full-area-ready timings.
+The remaining WebGL2 frame spikes need separate profiling. These measurements
+do not establish smooth 180 Hz or measure a physical variable-refresh display.
+
+## Movement measurement before upload paging
+
+A local headless Edge WebGPU comparison at 1280 x 800 using
+`scripts/verify-camera-turn.mjs` (including CPU profiler overhead):
+
+| Measurement | Before worker/preparation changes | After |
+| --- | ---: | ---: |
+| First moving camera sweep, p95 interval | 83.4 ms | 49.9 ms |
+| Repeated moving camera sweep, p95 interval | 49.8 ms | 33.5 ms |
+| Streamed voxel rebuild duration | 5.40 s | 3.05 s |
+| Worst frame interval during that rebuild | 583.3 ms | 66.7 ms |
+
+The rebuilt area continued presenting 120 frames. No shader or console errors
+were recorded. This comparison retains the same test path and viewport; the
+moving camera's timing affects the exact sampled views, and it is not a GPU-time
+or physical-display measurement. Evidence: `evidence/camera-turn.json` and
+`evidence/camera-turn-before-workers.json`.
+
+A separate fixed-position WebGPU rotation check, without the CPU profiler,
+recorded 16.8 ms p95 over each of two 180-frame sweeps, maximum 33.4 ms and no
+intervals over 50 ms. Worker/preparation completion counters did not change:
+turning did not trigger missing asset preparation. Its new-area rebuild had a
+100 ms maximum interval. The corresponding WebGL2 rotation check had 33.4 ms
+p95, no intervals over 50 ms, and unchanged preparation counters. Its new-area
+rebuild peaked at 116.6 ms. Both backends retained the old lighting during the
+worker job and reported no shader/console errors. Movement hitches are reduced,
+not eliminated.
+Runtime scene traversal, draw submission, GPU uploads and rendering still cost
+frame time. These checks do not establish smooth 180 Hz operation.
+
 ## License
 
 Released under the [MIT License](LICENSE). Generated texture provenance is
 recorded in [docs/asset-prompts.md](docs/asset-prompts.md). Third-party npm
 dependencies retain their respective licenses.
 
-Local verification scripts are included. No GitHub Actions workflows or automated
-CI tests are configured for this initial release. This is an experimental desktop
-renderer; the streaming/performance limitations above remain open.
+Local verification scripts are included. GitHub Actions builds and deploys the
+demo to GitHub Pages on pushes to `main`, or when the Pages workflow is run
+manually. No tests run in Actions. To preview the same subdirectory build locally,
+run `npm run build:pages`, then `npm run preview -- --base /BakedVoxelLighting/`
+and open `http://127.0.0.1:4173/BakedVoxelLighting/`. This is an experimental
+desktop renderer; the streaming/performance limitations above remain open.

@@ -1,3 +1,12 @@
+import { WorkerClient } from "./worker-client.js";
+const worker = new WorkerClient(
+  new Worker(new URL("./merged-worker.js", import.meta.url), {
+    type: "module",
+    name: "forest merge",
+  }),
+  "forest merge",
+);
+export const mergedWorkerStats = worker.stats;
 import { billboardTSL } from "./tsl-materials.js";
 import * as T from "three/webgpu";
 import { BakeCache } from "./cache.js";
@@ -39,10 +48,23 @@ function makeAtlas(prototypes) {
     t.minFilter = T.LinearMipmapLinearFilter;
     t.generateMipmaps = false;
     const normalMap = data === normal;
-    t.mipmaps = first.mips.map((level,lod) => {
-      const pixels=new Uint8Array(level.width*level.height*prototypes.length*4);
-      prototypes.forEach((p,row)=>pixels.set(normalMap ? p.farAtlas.record.mips[lod].normals : p.farAtlas.record.mips[lod].data,row*level.width*level.height*4));
-      return {data:pixels,width:level.width,height:level.height*prototypes.length};
+    t.mipmaps = first.mips.map((level, lod) => {
+      const pixels = new Uint8Array(
+        level.width * level.height * prototypes.length * 4,
+      );
+      prototypes.forEach((p, row) =>
+        pixels.set(
+          normalMap
+            ? p.farAtlas.record.mips[lod].normals
+            : p.farAtlas.record.mips[lod].data,
+          row * level.width * level.height * 4,
+        ),
+      );
+      return {
+        data: pixels,
+        width: level.width,
+        height: level.height * prototypes.length,
+      };
     });
     t.needsUpdate = true;
     return t;
@@ -67,46 +89,7 @@ function material() {
   mergedTemplate = m;
   return m;
 }
-function bake(c, prototypes) {
-  const position = [],
-    center = [],
-    info = [],
-    uv = [],
-    indices = [],
-    normal = [];
-  c.trees.forEach((t, i) => {
-    const p = prototypes[t.variant],
-      a = p.farAtlas.record;
-    const v = p.center
-      .clone()
-      .multiplyScalar(t.scale)
-      .applyAxisAngle(new T.Vector3(0, 1, 0), t.rotation)
-      .add(new T.Vector3(t.x, t.y, t.z));
-    for (const [x, y, u, vv] of [
-      [-0.5, -0.5, 0, 0],
-      [0.5, -0.5, 1, 0],
-      [0.5, 0.5, 1, 1],
-      [-0.5, 0.5, 0, 1],
-    ]) {
-      position.push(x * a.width * t.scale, y * a.height * t.scale, 0);
-      center.push(v.x, v.y, v.z);
-      info.push(t.rotation, t.variant);
-      uv.push(u, vv);
-      normal.push(0, 0, 1);
-    }
-    const k = i * 4;
-    indices.push(k, k + 1, k + 2, k, k + 2, k + 3);
-  });
-  return {
-    position: new Float32Array(position),
-    plantCenter: new Float32Array(center),
-    plantInfo: new Float32Array(info),
-    uv: new Float32Array(uv),
-    normal: new Float32Array(normal),
-    indices: new Uint32Array(indices),
-  };
-}
-function install(c, record) {
+async function install(c, record, clusters, version) {
   const g = new T.BufferGeometry();
   for (const [name, size] of [
     ["position", 3],
@@ -124,14 +107,28 @@ function install(c, record) {
   mesh.userData.ownedGeometry = true;
   const group = new T.Group();
   group.add(mesh);
+  group.visible = false;
+  // Do not publish an uncompiled replacement into the next frame.
+  await clusters.prepareGroup?.(group);
+  if (version !== generation) {
+    g.dispose();
+    mesh.material.dispose();
+    return;
+  }
   group.visible = c.levels[3].visible;
   c.unmergedFar = c.levels[3];
   c.unmergedFar.visible = false;
   c.unmergedFar.removeFromParent();
   c.levels[3] = group;
   mergedStats.baked++;
+  clusters.lodRevision = (clusters.lodRevision || 0) + 1;
 }
-export function updateMergedVisibility(clusters, camera, scene, prewarm = false) {
+export function updateMergedVisibility(
+  clusters,
+  camera,
+  scene,
+  prewarm = false,
+) {
   if (!clusters.atlasIdentity) return;
   if (identity !== clusters.atlasIdentity) {
     generation++;
@@ -188,14 +185,17 @@ export function updateMergedVisibility(clusters, camera, scene, prewarm = false)
     version = generation,
     key = `merged-far-v1:${identity}:${c.id}`;
   return (async () => {
-    await ready;
-    let record = await cache.get(key);
-    if (record) mergedStats.hits++;
-    else {
-      record = bake(c, clusters.prototypes);
-      await cache.put(key, record);
-    }
-    if (version === generation) install(c, record);
+    const { record, hit } = await worker.run("merge", {
+      key,
+      trees: c.trees,
+      prototypes: clusters.prototypes.map((p) => ({
+        center: p.center.toArray(),
+        width: p.farAtlas.record.width,
+        height: p.farAtlas.record.height,
+      })),
+    });
+    if (hit) mergedStats.hits++;
+    if (version === generation) await install(c, record, clusters, version);
   })()
     .catch((e) => mergedStats.errors.push(e.message))
     .finally(() => {

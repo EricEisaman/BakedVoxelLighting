@@ -32,7 +32,16 @@ export const ref = (u, name, type = "float") =>
   N.reference("value", type, u[name]);
 export function texRef(u, name) {
   const t = N.texture(u[name].value).setUpdateMatrix(false);
-  t.onRenderUpdate(() => u[name].value);
+  // TextureNode.sample() clones the node, and setup() can disable its update
+  // callback. Keep the binding live through the base node's value accessor;
+  // sampled clones already delegate their value to that base in Three.js.
+  Object.defineProperty(t, "value", {
+    get: () => u[name].value,
+    set: (value) => {
+      u[name].value = value;
+    },
+    configurable: true,
+  });
   return t;
 }
 export function terrainNode(field, p, grid) {
@@ -60,19 +69,31 @@ empty3D.format = T.RGBAFormat;
 empty3D.minFilter = empty3D.magFilter = T.LinearFilter;
 empty2D.needsUpdate = empty3D.needsUpdate = true;
 export function volumePass(kind, u, grid) {
-  const texture = (name, volume = false) => volume
-    ? N.texture3D(u[name]?.value || empty3D)
-    : N.texture(u[name]?.value || empty2D);
-  const field = texture('field', true);
-  return fullscreen(volumeKernel({
-    uv: N.uv(), dims: ref(u,'dims','vec3'), origin: ref(u,'vmin','vec3'),
-    extent: ref(u,'extent','vec3'), terrain: texture('terrainField'), trees: texture('trees'),
-    details: texture('details',true), field, transportMap: texture('transportMap'),
-    linearSampler: N.sampler(field), treeCount: N.int(u.treeCount?.value || 0),
-    grid: N.float(grid), mode: N.int({occupancy:0,transport:1,lighting:2}[kind] ?? 2),
-    directionMode: u.directionMode ? ref(u,'directionMode') : N.float(0),
-    sun: u.sun ? ref(u,'sun','vec3') : N.vec3(0,1,0),
-    lamp: u.lampPosition ? ref(u,'lampPosition','vec3') : N.vec3(0),
-    power: u.lampPower ? ref(u,'lampPower') : N.float(0),
-  }),u);
+  const texture = (name, volume = false) =>
+    volume
+      ? N.texture3D(u[name]?.value || empty3D)
+      : N.texture(u[name]?.value || empty2D);
+  const field = texture("field", true);
+  return fullscreen(
+    volumeKernel({
+      uv: N.uv(),
+      dims: ref(u, "dims", "vec3"),
+      origin: ref(u, "vmin", "vec3"),
+      extent: ref(u, "extent", "vec3"),
+      terrain: texture("terrainField"),
+      trees: texture("trees"),
+      details: texture("details", true),
+      field,
+      transportMap: texture("transportMap"),
+      linearSampler: N.sampler(field),
+      treeCount: N.int(u.treeCount?.value || 0),
+      grid: N.float(grid),
+      mode: N.int({ occupancy: 0, transport: 1, lighting: 2 }[kind] ?? 2),
+      directionMode: u.directionMode ? ref(u, "directionMode") : N.float(0),
+      sun: u.sun ? ref(u, "sun", "vec3") : N.vec3(0, 1, 0),
+      lamp: u.lampPosition ? ref(u, "lampPosition", "vec3") : N.vec3(0),
+      power: u.lampPower ? ref(u, "lampPower") : N.float(0),
+    }),
+    u,
+  );
 }

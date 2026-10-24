@@ -1,3 +1,6 @@
+import { reorderVoxels } from "./voxel-details.js";
+import { prepareForRender } from "./renderer-jobs.js";
+import { uploadTextures } from "./gpu-uploads.js";
 import { nativeVolumeSource } from "./native-kernels.js";
 import tslBakeSource from "./tsl-baking.js?raw";
 import { volumePass, readPixels } from "./tsl-baking.js";
@@ -46,7 +49,7 @@ export const lightUniforms = {
   volumeSize: { value: volumeSize },
   bakedEnabled: { value: 0 },
   time: { value: 0 },
-  daylight: {value:1},
+  daylight: { value: 1 },
   terrainField: { value: terrainTexture },
   rootField: { value: rootTexture },
   liveSunDirection: { value: new T.Vector3(-0.6, 0.6, -0.5) },
@@ -54,6 +57,9 @@ export const lightUniforms = {
   liveLampPower: { value: 0 },
   groundMap: { value: null },
   grassGround: { value: fallback.clone() },
+  grassHabitat: { value: fallback.clone() },
+  grassSurface: { value: fallback.clone() },
+  grassSurfaceNormal: { value: fallback.clone() },
   directionAtlas: { value: fallback.clone() },
   dryGroundMap: { value: null },
   rockMap: { value: null },
@@ -71,17 +77,6 @@ export const lightingState = {
   geometryKey: "",
   n: 0,
 };
-function reorder(packed, n) {
-  const data = new Uint8Array(packed.length);
-  for (let y = 0; y < n / 2; y++)
-    for (let z = 0; z < n; z++)
-      for (let x = 0; x < n; x++) {
-        const a = (x + n * (z + n * y)) * 4,
-          b = (x + n * (y + (n / 2) * z)) * 4;
-        data.set(packed.subarray(a, a + 4), b);
-      }
-  return data;
-}
 function data3D(data, n) {
   const t = new T.Data3DTexture(data, n, n / 2, n);
   t.format = T.RGBAFormat;
@@ -122,13 +117,14 @@ export async function bakeVolume(
   onProgress,
 ) {
   const start = performance.now();
+  const origin = volumeMin.clone();
   const geometryKey =
     "occupancy:" +
     (await digest(
       JSON.stringify({
         world: world.bakeIdentity,
         n,
-        origin: volumeMin.toArray(),
+        origin: origin.toArray(),
         assetHash,
         shader: nativeVolumeSource + tslBakeSource,
       }),
@@ -142,7 +138,7 @@ export async function bakeVolume(
   const dims = new T.Vector3(n, n / 2, n),
     uniforms = {
       dims: { value: dims },
-      vmin: { value: volumeMin },
+      vmin: { value: origin },
       extent: { value: volumeSize },
       terrainField: { value: terrainTexture },
       rootField: { value: rootTexture },
@@ -160,12 +156,17 @@ export async function bakeVolume(
     const detailRecord = await world.buildVoxelDetails(
       world,
       n,
-      volumeMin,
+      origin,
       volumeSize,
     );
     const detailTexture = data3D(detailRecord.data, n);
     const treeData = new Float32Array(1100 * 4);
-    const localTrees = world.areaIndexes.trees.query(volumeMin.x,volumeMin.z,volumeMin.x+volumeSize.x,volumeMin.z+volumeSize.z);
+    const localTrees = world.areaIndexes.trees.query(
+      origin.x,
+      origin.z,
+      origin.x + volumeSize.x,
+      origin.z + volumeSize.z,
+    );
     localTrees
       .slice(0, 1100)
       .forEach((t, i) => treeData.set([t.x, t.y, t.z, t.scale], i * 4));
@@ -187,6 +188,7 @@ export async function bakeVolume(
       },
       TERRAIN_GRID,
     );
+    await prepareForRender(renderer, scene, camera, scene, target);
     try {
       renderer.setRenderTarget(target);
       renderer.render(scene, camera);
@@ -194,7 +196,7 @@ export async function bakeVolume(
       const packed = new Uint8Array(((n * n * n) / 2) * 4);
       await readPixels(renderer, target, 0, 0, n, (n * n) / 2, packed);
       geometry = {
-        data: reorder(packed, n),
+        data: await reorderVoxels(packed, n),
         n,
         kinds: detailRecord.kinds,
         contributors: detailRecord.counts,
@@ -210,7 +212,10 @@ export async function bakeVolume(
   lightingState.contributors = geometry.contributors;
   const field = data3D(geometry.data, n);
   const transportKey =
-    "transport:" + (await digest(geometryKey + nativeVolumeSource + tslBakeSource + "transport"));
+    "transport:" +
+    (await digest(
+      geometryKey + nativeVolumeSource + tslBakeSource + "transport",
+    ));
   let transport = await cache.get(transportKey);
   lightingState.transportCacheHit = !!transport;
   if (!transport) {
@@ -224,6 +229,7 @@ export async function bakeVolume(
       },
       TERRAIN_GRID,
     );
+    await prepareForRender(renderer, scene, camera, scene, target);
     try {
       for (let mode = 0; mode < 2; mode++) {
         quad.material.uniforms.directionMode.value = mode;
@@ -257,7 +263,7 @@ export async function bakeVolume(
   );
   directionMap.needsUpdate = true;
   directionMap.minFilter = directionMap.magFilter = T.LinearFilter;
-  lightUniforms.directionAtlas.value = directionMap;
+
   lightingState.transportKey = transportKey;
   lightingState.transportBakes = (lightingState.transportBakes || 0) + 1;
   quad.material = volumePass(
@@ -272,6 +278,10 @@ export async function bakeVolume(
     },
     TERRAIN_GRID,
   );
+  await prepareForRender(renderer, scene, camera, scene, target);
+  // This binding is consumed by the world, not by the lighting bake pass.
+  // Make it resident before publishing the matching volume origin/dimensions.
+  await uploadTextures(renderer, [directionMap]);
   if (active) {
     active.target.dispose();
     active.field.dispose();
@@ -288,23 +298,28 @@ export async function bakeVolume(
     directionMap,
     transport,
     transportMap,
-    origin: volumeMin.clone(),
+    origin,
     scene,
     camera,
     quad,
     material: quad.material,
     cachedTexture: null,
   };
-  lightUniforms.volumeMin.value.copy(volumeMin);
+  lightUniforms.directionAtlas.value = directionMap;
+  lightUniforms.volumeMin.value.copy(origin);
   lightUniforms.bakeDims.value.copy(dims);
-  refreshLighting(renderer,sun);
+  refreshLighting(renderer, sun);
   lightUniforms.bakedEnabled.value = 1;
   lightingState.geometryKey = geometryKey;
   lightingState.n = n;
   const key =
     "lighting:" +
     (await digest(
-      geometryKey + sun.toArray().join(",") + nativeVolumeSource + tslBakeSource + "lighting",
+      geometryKey +
+        sun.toArray().join(",") +
+        nativeVolumeSource +
+        tslBakeSource +
+        "lighting",
     ));
   let record = await cache.get(key);
   const cached = !!record;
@@ -327,6 +342,7 @@ export async function bakeVolume(
     );
     texture.minFilter = texture.magFilter = T.LinearFilter;
     texture.needsUpdate = true;
+    await uploadTextures(renderer, [texture]);
     active.cachedTexture = texture;
     lightUniforms.bakedAtlas.value = texture;
   }

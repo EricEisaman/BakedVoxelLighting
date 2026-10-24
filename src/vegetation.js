@@ -1,11 +1,27 @@
-import {buildGrassBatches} from "./grass-jobs.js";
+import {
+  TREE_TYPES,
+  TREE_VARIANTS,
+  GRASS_TYPES,
+  GRASS_COUNT,
+  GRASS_PATCH,
+  GRASS_MIXES,
+} from "./plant-catalog.js";
+import { grassHabitat, grassPopulation, patchNoise } from "./habitat.js";
+export { grassHabitat } from "./habitat.js";
+import { prepareAtlasMips } from "./atlas-mips.js";
+import { buildGrassBatches } from "./grass-jobs.js";
 import * as T from "three/webgpu";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 import { random, height } from "./world-data.js";
 import { TERRAIN_SIZE, terrainSample } from "./terrain-field.js";
 import { decorate, lightUniforms } from "./lighting.js";
 import { growPlant } from "./growth.js";
-import { captureSurface, instanced, surfaceBillboards, atlasMaterial } from "./impostors.js";
+import {
+  captureSurface,
+  instanced,
+  surfaceBillboards,
+  atlasMaterial,
+} from "./impostors.js";
 const card = new T.PlaneGeometry(1, 1);
 function mergedLeaves(items) {
   const dummy = new T.Object3D(),
@@ -28,6 +44,18 @@ function mergedLeaves(items) {
     dummy.scale.set(...t.s);
     dummy.updateMatrix();
     g.applyMatrix4(dummy.matrix);
+    if (t.n) {
+      const canopy = new T.Vector3(...t.n),
+        normal = g.attributes.normal;
+      for (let i = 0; i < normal.count; i++) {
+        const n = new T.Vector3()
+          .fromBufferAttribute(normal, i)
+          .multiplyScalar(0.45)
+          .addScaledVector(canopy, 0.55)
+          .normalize();
+        normal.setXYZ(i, n.x, n.y, n.z);
+      }
+    }
     const c = new T.Color(t.c),
       colors = new Float32Array(g.attributes.position.count * 3);
     for (let i = 0; i < colors.length; i += 3) colors.set([c.r, c.g, c.b], i);
@@ -39,15 +67,26 @@ function mergedLeaves(items) {
   return result;
 }
 function plantMaterials(assets, species, shrub = false) {
-  const name = ["oak", "birch", "ash"][species];
-  const bark = assets[["bark", "bark-birch", "bark-ash"][species]];
+  const name = shrub
+    ? ["hazel", "bramble", "ash"][species]
+    : TREE_TYPES[species];
+  const bark =
+    assets[
+      shrub ? "bark-ash" : ["bark", "bark-birch", "bark-ash", "bark"][species]
+    ];
   const wood = decorate(
     new T.MeshStandardMaterial({
       map: bark.map,
       normalMap: bark.normal,
       normalScale: new T.Vector2(0.6, 0.6),
       roughness: 1,
-      color: species === 1 ? 0xe2e1d5 : 0xc9bfaa,
+      color: shrub
+        ? 0xb4aa93
+        : species === 1
+          ? 0xf2f0e7
+          : species === 3
+            ? 0xc6b09b
+            : 0xe2d8c6,
     }),
   );
   const leaf = decorate(
@@ -58,8 +97,8 @@ function plantMaterials(assets, species, shrub = false) {
       alphaTest: 0.4,
       alphaToCoverage: true,
       side: T.DoubleSide,
-      roughness: 0.92,
-      color: 0xe3e5bb,
+      roughness: 0.86,
+      color: 0xf4f5ec,
       vertexColors: true,
     }),
     { wind: shrub ? 0.018 : 0.028 },
@@ -78,8 +117,13 @@ function makeModel(plant, assets, low = false) {
 }
 export function buildTrees(world, assets) {
   const prototypes = [];
-  for (let i = 0; i < 9; i++) {
-    const p = growPlant(9801 + i * 137, i % 3);
+  for (let i = 0; i < TREE_VARIANTS; i++) {
+    const p = growPlant(
+      9801 + i * 137,
+      i % TREE_TYPES.length,
+      false,
+      Math.floor(i / TREE_TYPES.length),
+    );
     p.foliage = mergedLeaves(p.leaves);
     p.model = makeModel(p, assets);
     const box = new T.Box3().setFromObject(p.model),
@@ -92,7 +136,7 @@ export function buildTrees(world, assets) {
   const clusters = world.clusters.map((c) => {
     const levels = [0, 1].map((level) => {
       const group = new T.Group();
-      for (let i = 0; i < 9; i++) {
+      for (let i = 0; i < TREE_VARIANTS; i++) {
         const transforms = c.trees
           .filter((t) => t.variant === i)
           .map((t) => ({
@@ -176,8 +220,8 @@ export async function bakeTreeHLOD(
       `tree-far:${identity}:${i}`,
     );
     onProgress(
-      `Capturing tree surfaces ${i + 1}/9`,
-      0.27 + (0.55 * (i + 1)) / 9,
+      `Capturing tree surfaces ${i + 1}/${prototypes.length}`,
+      0.27 + (0.55 * (i + 1)) / prototypes.length,
     );
     await new Promise(requestAnimationFrame);
   }
@@ -186,7 +230,7 @@ export async function bakeTreeHLOD(
     removeLevel(c.levels[3]);
     const middle = new T.Group(),
       far = new T.Group();
-    for (let k = 0; k < 9; k++) {
+    for (let k = 0; k < TREE_VARIANTS; k++) {
       const p = prototypes[k],
         trees = c.trees.filter((t) => t.variant === k);
       if (!trees.length) continue;
@@ -227,92 +271,114 @@ export async function bakeTreeHLOD(
     c.levels[3] = far;
   }
   clusters.atlasIdentity = identity;
+  clusters.lodRevision = (clusters.lodRevision || 0) + 1;
 }
 const grassCard = new T.PlaneGeometry(1, 1, 1, 3);
 grassCard.translate(0, 0.5, 0);
-function grassMaterial(assets, type) {
-  const name = ["meadow", "grass", "clover"][type];
+// Bend the carrier cards so the represented blades have a real ground footprint.
+for (let i = 0; i < grassCard.attributes.position.count; i++) {
+  const p = grassCard.attributes.position,
+    y = p.getY(i);
+  p.setZ(i, y * y * 0.32);
+}
+grassCard.computeVertexNormals();
+function grassMaterial(assets) {
   return decorate(
     new T.MeshStandardMaterial({
-      map: assets[name].map,
-      normalMap: assets[name].normal,
-      normalScale: new T.Vector2(0.2, 0.2),
+      map: assets.grassAtlas.map,
+      normalMap: assets.grassAtlas.normal,
+      normalScale: new T.Vector2(0.25, 0.25),
       alphaTest: 0.34,
       alphaToCoverage: true,
       side: T.DoubleSide,
-      roughness: 1,
-      color: type === 2 ? 0xe3e1cc : 0xe0e4b5,
+      roughness: 0.94,
+      color: 0xffffff,
     }),
-    { wind: type === 2 ? 0.025 : 0.065, grass: true },
+    { wind: 0.085, grass: true, grassAtlas: GRASS_TYPES.length },
   );
 }
-export function grassHabitat(x, z, land) {
-  const patch =
-    0.5 +
-    0.25 * Math.sin(x * 0.073 + Math.sin(z * 0.047) * 2.8) +
-    0.25 * Math.sin(z * 0.119 + x * 0.031);
-  return {
-    density: 0.58 + patch * 0.4,
-    clover: 0.06 + land.moisture * patch * 0.36,
-    seedheads: 0.07 + (1 - land.moisture) * (1 - patch) * 0.42,
-    height: 0.42 + patch * 0.8,
-    tint: patch,
-  };
+function grassMesh(assets, batch) {
+  const geometry = grassCard.clone();
+  geometry.setAttribute(
+    "plantType",
+    new T.InstancedBufferAttribute(batch.types, 1),
+  );
+  const mesh = new T.InstancedMesh(
+    geometry,
+    grassMaterial(assets),
+    batch.matrices.length / 16,
+  );
+  mesh.instanceMatrix.array.set(batch.matrices);
+  mesh.instanceMatrix.needsUpdate = true;
+  mesh.instanceColor = new T.InstancedBufferAttribute(batch.colours, 3);
+  mesh.userData.ownedGeometry = true;
+  mesh.userData.grassCard = true;
+  mesh.receiveShadow = true;
+  return mesh;
 }
-function* grassPointChunks(x, z, seed, count = 3400, span = 24, flat = false) {
-  const rng = random(seed),
-    types = [[], [], []];
-  for (let i = 0; i < count; i++) {
-    if (i && i % 128 === 0) yield;
-    const xx = x + (rng() - 0.5) * span,
-      zz = z + (rng() - 0.5) * span,
-      land = flat
-        ? { height: 0, traffic: 0, moisture: 0.5, slope: 0, root: 0 }
-        : terrainSample(xx, zz);
-    if (
-      land.traffic > 0.12 + rng() * 0.25 ||
-      land.slope > 0.62 ||
-      land.riverDistance < 10
-    )
-      continue;
-    // The same root field drives exposed soil and living ground-cover density.
-    if (rng() < T.MathUtils.smoothstep(land.root, 0.08, 0.65) * 0.98) continue;
-    const habitat = grassHabitat(xx, zz, land);
-    if (rng() > habitat.density) continue;
-    const type = rng() < habitat.clover ? 2 : rng() < habitat.seedheads ? 1 : 0,
-      scale =
-        (type === 2 ? 0.26 + rng() * 0.28 : 0.32 + rng() * 0.52) *
-        habitat.height;
-    const angle = rng() * Math.PI * .55 + Math.sin(xx*.018+zz*.011)*1.2;
+export function grassPoints(
+  x,
+  z,
+  seed,
+  count = GRASS_COUNT,
+  span = 24,
+  flat = false,
+) {
+  const groups = GRASS_TYPES.map(() => []);
+  const sample = flat
+    ? () => ({
+        height: 0,
+        traffic: 0,
+        moisture: 0.5,
+        slope: 0,
+        root: 0,
+        riverDistance: 100,
+      })
+    : terrainSample;
+  for (const p of grassPopulation(x, z, seed, count, span, sample))
     for (let k = 0; k < 2; k++)
-      types[type].push({
-        p: [xx, land.height - 0.025, zz],
-        r: [0, angle + (k * Math.PI) / 2, 0],
-        s: [scale * (type === 2 ? 1.3 : 1.1), scale, scale],
-        c: new T.Color()
-          .setHSL(0.19 + rng() * 0.04, 0.20, 0.59 + habitat.tint * .18 + rng() * .12)
-          .getHex(),
+      groups[p.type].push({
+        p: [p.x, p.y, p.z],
+        r: [0, p.angle + k * Math.PI * 0.5, 0],
+        s: [p.sx, p.sy, p.sx],
+        c: new T.Color(...p.colour).getHex(),
       });
+  return groups;
+}
+const yieldWork = () => new Promise((resolve) => setTimeout(resolve, 0));
+const grassRequests = [];
+let grassBusy = false;
+const grassWaiters = [];
+async function pumpGrassJobs() {
+  if (grassBusy) return;
+  grassBusy = true;
+  try {
+    while (grassRequests.length) {
+      grassRequests.sort(
+        (a, b) =>
+          a.p.priority +
+          (a.level === 2 ? 0 : 10) -
+          (b.p.priority + (b.level === 2 ? 0 : 10)),
+      );
+      const { p, level, generation } = grassRequests.shift();
+      try {
+        if (generation === p.generation) {
+          await yieldWork();
+          await p.build(level, generation);
+        }
+      } finally {
+        if (p.pending.get(level) === generation) p.pending.delete(level);
+      }
+    }
+  } finally {
+    grassBusy = false;
+    grassWaiters.splice(0).forEach((resolve) => resolve());
   }
-  return types;
 }
-export function grassPoints(...args) {
-  const iterator=grassPointChunks(...args);let result;
-  do {result=iterator.next();} while(!result.done);
-  return result.value;
+export async function finishGrassJobs() {
+  if (grassBusy || grassRequests.length)
+    await new Promise((resolve) => grassWaiters.push(resolve));
 }
-const yieldWork=()=>new Promise(resolve=>setTimeout(resolve,0));
-const grassRequests=[];let grassBusy=false;const grassWaiters=[];
-async function pumpGrassJobs(){
- if(grassBusy)return;grassBusy=true;
- try{while(grassRequests.length){
-  grassRequests.sort((a,b)=>(a.p.priority+(a.level===2?0:10))-(b.p.priority+(b.level===2?0:10)));
-  const {p,level,generation}=grassRequests.shift();
-  try{if(generation===p.generation){await yieldWork();await p.build(level,generation);}}
-  finally{p.pending.delete(level);}
- }}finally{grassBusy=false;grassWaiters.splice(0).forEach(resolve=>resolve());}
-}
-export async function finishGrassJobs(){if(grassBusy||grassRequests.length)await new Promise(resolve=>grassWaiters.push(resolve));}
 export function buildGrass(assets) {
   const patches = [];
   for (let z = -TERRAIN_SIZE / 2 + 12; z < TERRAIN_SIZE / 2 - 12; z += 24)
@@ -326,53 +392,84 @@ export function buildGrass(assets) {
         current: -1,
         kind: "grass",
       };
-      p.pending = new Set();
+      p.pending = new Map();
       p.generation = 0;
       p.ensure = (level) => {
-        if(p.levels[level] || level===3 || p.pending.has(level))return;
-        p.pending.add(level);const generation=p.generation;
-        grassRequests.push({p,level,generation});
+        if (p.levels[level] || level === 3 || p.pending.has(level)) return;
+        const generation = p.generation;
+        p.pending.set(level, generation);
+        grassRequests.push({ p, level, generation });
         pumpGrassJobs().catch(console.error);
       };
-      p.build = async (level,generation) => {
-        if(generation!==p.generation)return;
+      p.build = async (level, generation) => {
+        if (generation !== p.generation) return;
         if (level === 2 && grass.templates.length === 3) {
-          const group=new T.Group(),batches=await buildGrassBatches(x,z,p.seed,2,grass.identity);
-          if(generation!==p.generation)return;
-          for(let k=0;k<3;k++){
-            const batch=batches[k],count=batch.matrices.length/16;if(!count)continue;
-            const atlas=grass.templates[k];
-            const mesh=new T.InstancedMesh(new T.PlaneGeometry(atlas.record.width,atlas.record.height),atlasMaterial(atlas,.18),count);
-            mesh.instanceMatrix.array.set(batch.matrices);mesh.instanceMatrix.needsUpdate=true;
-            mesh.instanceColor=new T.InstancedBufferAttribute(batch.colours,3);
-            mesh.boundingSphere=new T.Sphere(p.center.clone().add(new T.Vector3(0,.6,0)),32);
-            mesh.userData.ownedGeometry=true;mesh.userData.grassCard=true;group.add(mesh);
+          const group = new T.Group(),
+            batches = await buildGrassBatches(x, z, p.seed, 2, grass.identity);
+          if (generation !== p.generation) return;
+          for (let k = 0; k < 3; k++) {
+            const batch = batches[k],
+              count = batch.matrices.length / 16;
+            if (!count) continue;
+            const atlas = grass.templates[k];
+            const mesh = new T.InstancedMesh(
+              new T.PlaneGeometry(atlas.record.width, atlas.record.height),
+              atlasMaterial(atlas, 0.26),
+              count,
+            );
+            mesh.instanceMatrix.array.set(batch.matrices);
+            mesh.instanceMatrix.needsUpdate = true;
+            mesh.instanceColor = new T.InstancedBufferAttribute(
+              batch.colours,
+              3,
+            );
+            mesh.boundingSphere = new T.Sphere(
+              p.center.clone().add(new T.Vector3(0, 0.6, 0)),
+              32,
+            );
+            mesh.userData.ownedGeometry = true;
+            mesh.userData.grassCard = true;
+            group.add(mesh);
           }
           await grass.prepare?.(group);
-          if(generation!==p.generation){removeLevel(group);return;}
+          if (generation !== p.generation) {
+            removeLevel(group);
+            return;
+          }
           p.levels[2] = group;
+          patches.lodRevision = (patches.lodRevision || 0) + 1;
           return;
         }
-        const batches = await buildGrassBatches(x,z,p.seed,level,grass.identity);
-        if(generation!==p.generation)return;
-        const group=new T.Group();
-        for(let k=0;k<3;k++){
-          const batch=batches[k],count=batch.matrices.length/16;
-          if(!count)continue;
-          const mesh=new T.InstancedMesh(grassCard,grassMaterial(assets,k),count);
-          mesh.instanceMatrix.array.set(batch.matrices);
-          mesh.instanceColor=new T.InstancedBufferAttribute(batch.colours,3);
-          mesh.instanceMatrix.needsUpdate=true;
-          mesh.boundingSphere=new T.Sphere(p.center.clone().add(new T.Vector3(0,.6,0)),32);
-          mesh.userData.grassCard=true;mesh.receiveShadow=true;
+        const batches = await buildGrassBatches(
+          x,
+          z,
+          p.seed,
+          level,
+          grass.identity,
+        );
+        if (generation !== p.generation) return;
+        const group = new T.Group();
+        const batch = batches[0];
+        if (batch.matrices.length) {
+          const mesh = grassMesh(assets, batch);
+          mesh.boundingSphere = new T.Sphere(
+            p.center.clone().add(new T.Vector3(0, 1, 0)),
+            34,
+          );
           group.add(mesh);
         }
         await grass.prepare?.(group);
-        if(generation!==p.generation){removeLevel(group);return;}
+        if (generation !== p.generation) {
+          removeLevel(group);
+          return;
+        }
         p.levels[level] = group;
+        patches.lodRevision = (patches.lodRevision || 0) + 1;
       };
       p.release = () => {
         p.generation++;
+        p.pending.clear();
+        patches.lodRevision = (patches.lodRevision || 0) + 1;
         for (let i = 0; i < 3; i++) {
           removeLevel(p.levels[i]);
           p.levels[i] = null;
@@ -380,8 +477,13 @@ export function buildGrass(assets) {
       };
       patches.push(p);
     }
-  patches.grid=new Map(patches.map(p=>[`${Math.round((p.x+1988)/24)}:${Math.round((p.z+1988)/24)}`,p]));
-  patches.active=new Set();
+  patches.grid = new Map(
+    patches.map((p) => [
+      `${Math.round((p.x + 1988) / 24)}:${Math.round((p.z + 1988) / 24)}`,
+      p,
+    ]),
+  );
+  patches.active = new Set();
   const grass = { patches, assets, templates: [] };
   return grass;
 }
@@ -400,22 +502,64 @@ export async function bakeGrassLOD(
   }
   grass.templates = [];
   for (let k = 0; k < 3; k++) {
-    const points = grassPoints(0, 0, 981 + k, 16, 2.4, true),
+    const batch = { matrices: [], colours: [], types: [] },
       source = new T.Group();
-    for (const j of [k])
-      source.add(
-        instanced(grassCard, grassMaterial(grass.assets, j), points[j]),
-      );
+    const habitat = {
+      weights: GRASS_MIXES[k],
+      density: 1,
+      height: 1,
+      tint: 0.96,
+      dry: k === 1 ? 0.6 : 0.15,
+      flow: k * 0.8,
+    };
+    const sample = () => ({
+      height: 0,
+      traffic: 0,
+      moisture: 0.5,
+      slope: 0,
+      root: 0,
+      riverDistance: 100,
+    });
+    for (const p of grassPopulation(0, 0, 981 + k, 37, 2.5, sample, habitat))
+      for (let j = 0; j < 2; j++) {
+        const a = p.angle + j * Math.PI * 0.5,
+          c = Math.cos(a),
+          s = Math.sin(a);
+        batch.matrices.push(
+          c * p.sx,
+          0,
+          -s * p.sx,
+          0,
+          0,
+          p.sy,
+          0,
+          0,
+          s * p.sx,
+          0,
+          c * p.sx,
+          0,
+          p.x,
+          p.y,
+          p.z,
+          1,
+        );
+        batch.colours.push(...p.colour);
+        batch.types.push(p.type);
+      }
+    for (const key of Object.keys(batch))
+      batch[key] = new Float32Array(batch[key]);
+    source.add(grassMesh(grass.assets, batch));
     const atlas = await captureSurface(
       renderer,
       source,
-      new T.Vector3(0, 0.5, 0),
-      3.1,
-      1.3,
-      128,
+      new T.Vector3(0, GRASS_PATCH.centerY, 0),
+      GRASS_PATCH.width,
+      GRASS_PATCH.height,
+      256,
       8,
       cache,
-      `grass-surface:${identity}:${k}`,
+      "grass-surface:" + identity + ":" + k,
+      { grassPatch: true },
     );
     grass.templates.push(atlas);
     removeLevel(source);
@@ -426,17 +570,37 @@ export async function bakeGrassLOD(
   return [];
 }
 export function updateLOD(items, camera, force, distances, scene) {
+  const previous = items.lodState,
+    position = camera.position,
+    revision = items.lodRevision || 0;
+  // Turning changes frustum visibility, not distance LOD. Renderer culling still runs each frame.
+  if (
+    previous &&
+    previous.force === force &&
+    previous.revision === revision &&
+    Math.abs(previous.x - position.x) < 0.001 &&
+    Math.abs(previous.y - position.y) < 0.001 &&
+    Math.abs(previous.z - position.z) < 0.001 &&
+    previous.distances.every((v, i) => v === distances[i])
+  )
+    return previous.counts;
   const counts = [0, 0, 0, 0];
-  let candidates=items;
-  if(items.grid){
-    candidates=new Set(items.active);items.active=new Set();
-    const gx=Math.floor((camera.position.x+2000)/24),gz=Math.floor((camera.position.z+2000)/24);
-    for(let z=gz-9;z<=gz+9;z++)for(let x=gx-9;x<=gx+9;x++){const p=items.grid.get(`${x}:${z}`);if(p)candidates.add(p);}
-    counts[3]=items.length-candidates.size;
+  let candidates = items;
+  if (items.grid) {
+    candidates = new Set(items.active);
+    items.active = new Set();
+    const gx = Math.floor((camera.position.x + 2000) / 24),
+      gz = Math.floor((camera.position.z + 2000) / 24);
+    for (let z = gz - 9; z <= gz + 9; z++)
+      for (let x = gx - 9; x <= gx + 9; x++) {
+        const p = items.grid.get(`${x}:${z}`);
+        if (p) candidates.add(p);
+      }
+    counts[3] = items.length - candidates.size;
   }
   for (const c of candidates) {
     const d = c.center.distanceTo(camera.position);
-    c.priority=d;
+    c.priority = d;
     if (c.kind === "grass" && d > 190) {
       counts[3]++;
       if (c.current !== 3) {
@@ -484,21 +648,34 @@ export function updateLOD(items, camera, force, distances, scene) {
         }
       }
     }
-    if(c.kind==='grass' && level<3){
+    if (c.kind === "grass" && level < 3) {
       c.ensure?.(2);
-      for(let i=0;i<3;i++)if(weights[i]>0)c.ensure?.(i);
-      for(let i=0;i<3;i++)if(weights[i]>0 && !c.levels[i]){
-        const fallback=[2,1,0].find(j=>c.levels[j]);
-        if(fallback!==undefined){weights[fallback]+=weights[i];weights[i]=0;}
-      }
+      for (let i = 0; i < 3; i++) if (weights[i] > 0) c.ensure?.(i);
+      for (let i = 0; i < 3; i++)
+        if (weights[i] > 0 && !c.levels[i]) {
+          const fallback = [2, 1, 0].find((j) => c.levels[j]);
+          if (fallback !== undefined) {
+            weights[fallback] += weights[i];
+            weights[i] = 0;
+          }
+        }
     }
-    if(items.prepareGroup){
-      for(let i=0;i<4;i++)if(weights[i]>0 && c.levels[i] && !c.levels[i].userData.pipelineReady){
-        items.prepareGroup(c.levels[i]);
-        const fallback=[3,2,1,0].find(j=>c.levels[j]?.userData.pipelineReady);
-        if(fallback!==undefined){weights[fallback]+=weights[i];weights[i]=0;}
-        else weights[i]=0;
-      }
+    if (items.prepareGroup) {
+      for (let i = 0; i < 4; i++)
+        if (
+          weights[i] > 0 &&
+          c.levels[i] &&
+          !c.levels[i].userData.pipelineReady
+        ) {
+          items.prepareGroup(c.levels[i]).catch(() => {});
+          const fallback = [3, 2, 1, 0].find(
+            (j) => c.levels[j]?.userData.pipelineReady,
+          );
+          if (fallback !== undefined) {
+            weights[fallback] += weights[i];
+            weights[i] = 0;
+          } else weights[i] = 0;
+        }
     }
     for (let i = 0; i < 4; i++) {
       if (weights[i] > 0) c.ensure?.(i);
@@ -519,6 +696,15 @@ export function updateLOD(items, camera, force, distances, scene) {
     }
     if (c.kind === "grass" && d > 190 && force < 0) c.release?.();
   }
+  items.lodState = {
+    x: position.x,
+    y: position.y,
+    z: position.z,
+    force,
+    revision,
+    distances: [...distances],
+    counts,
+  };
   return counts;
 }
 
@@ -527,91 +713,356 @@ export function buildShrubs(world, assets) {
   for (let k = 0; k < 3; k++) {
     const p = growPlant(552 + k * 83, k, true);
     p.foliage = mergedLeaves(p.leaves);
+    p.model = makeModel(p, assets);
+    const box = new T.Box3().setFromObject(p.model),
+      size = box.getSize(new T.Vector3());
+    p.center = box.getCenter(new T.Vector3());
+    p.width = Math.hypot(size.x, size.z) * 1.04;
+    p.height = size.y * 1.06;
     prototypes.push(p);
   }
   const groups = [];
   for (const c of world.clusters) {
     const rng = random(c.id + 4100),
-      group = new T.Group();
+      group = new T.Group(),
+      all = [];
     for (let k = 0; k < 3; k++) {
       const transforms = [];
-      for (let i = 0; i < 8; i++) {
+      for (let patch = 0; patch < 4; patch++) {
         const anchor = c.trees[Math.floor(rng() * c.trees.length)];
         if (!anchor) continue;
-        const a = rng() * 6.28,
-          r = 4 + rng() * 9,
-          x = anchor.x + Math.cos(a) * r,
-          z = anchor.z + Math.sin(a) * r,
-          s = terrainSample(x, z);
-        if (s.traffic > 0.14 || s.slope > 0.5) continue;
-        const scale = 0.55 + rng() * 0.75;
-        transforms.push({
-          p: [x, s.height, z],
-          r: [0, rng() * 6.28, 0],
-          s: [scale, scale, scale],
-        });
+        const a = rng() * Math.PI * 2,
+          r = 5 + rng() * 12,
+          px = anchor.x + Math.cos(a) * r,
+          pz = anchor.z + Math.sin(a) * r;
+        for (let j = 0; j < 3; j++) {
+          const x = px + (rng() - 0.5) * 6,
+            z = pz + (rng() - 0.5) * 6,
+            s = terrainSample(x, z);
+          if (
+            s.traffic > 0.12 ||
+            s.slope > 0.58 ||
+            s.riverDistance < 9 ||
+            s.root > 0.6
+          )
+            continue;
+          const size = 0.65 + rng() * 0.65;
+          transforms.push({
+            p: [x, s.height - 0.03, z],
+            r: [0, rng() * 6.28, 0],
+            s: [size * (k === 1 ? 1.15 : 1), size, size],
+          });
+        }
       }
+      all.push(transforms);
       if (transforms.length) {
         const m = plantMaterials(assets, k, true);
-        group.add(
-          instanced(prototypes[k].high, m[0], transforms),
-          instanced(prototypes[k].foliage, m[1], transforms),
-        );
+        for (const [geometry, material] of [
+          [prototypes[k].low, m[0]],
+          [prototypes[k].foliage, m[1]],
+        ]) {
+          const mesh = instanced(geometry, material, transforms);
+          mesh.castShadow = mesh.receiveShadow = true;
+          group.add(mesh);
+        }
       }
     }
-    groups.push({ group, center: new T.Vector3(c.x, height(c.x, c.z), c.z) });
+    groups.push({
+      group,
+      far: null,
+      transforms: all,
+      center: new T.Vector3(c.x, height(c.x, c.z), c.z),
+    });
   }
+  groups.prototypes = prototypes;
   return groups;
 }
+export async function bakeShrubLOD(renderer, shrubs, cache, identity) {
+  if (shrubs.identity === identity) return;
+  for (let k = 0; k < shrubs.prototypes.length; k++) {
+    const p = shrubs.prototypes[k];
+    p.atlas?.texture.dispose();
+    p.atlas?.normal.dispose();
+    p.atlas = await captureSurface(
+      renderer,
+      p.model,
+      p.center,
+      p.width,
+      p.height,
+      128,
+      8,
+      cache,
+      "shrub-surface:" + identity + ":" + k,
+    );
+  }
+  for (const entry of shrubs) {
+    removeLevel(entry.far);
+    const group = new T.Group();
+    entry.transforms.forEach((ts, k) => {
+      if (!ts.length) return;
+      const p = shrubs.prototypes[k];
+      const transforms = ts.map((t) => ({
+        r: t.r,
+        s: t.s,
+        p: p.center
+          .clone()
+          .multiply(new T.Vector3(...t.s))
+          .applyAxisAngle(new T.Vector3(0, 1, 0), t.r[1])
+          .add(new T.Vector3(...t.p))
+          .toArray(),
+      }));
+      group.add(surfaceBillboards(p.atlas, transforms));
+    });
+    entry.far = group;
+  }
+  shrubs.identity = identity;
+}
 export function updateShrubs(items, camera, scene) {
+  const p = camera.position,
+    last = items.lodState;
+  if (
+    last &&
+    Math.abs(last.x - p.x) < 0.001 &&
+    Math.abs(last.y - p.y) < 0.001 &&
+    Math.abs(last.z - p.z) < 0.001 &&
+    last.identity === items.identity
+  )
+    return;
+  items.lodState = { x: p.x, y: p.y, z: p.z, identity: items.identity };
   for (const p of items) {
     const d = p.center.distanceTo(camera.position),
-      fade = 1 - T.MathUtils.smoothstep(d, 150, 205);
-    p.group.visible = fade > 0;
-    if (fade > 0 && p.group.parent !== scene) scene.add(p.group);
-    else if (fade <= 0 && p.group.parent) p.group.removeFromParent();
-    if (fade > 0)
-      p.group.traverse((o) => {
-        if (o.material?.userData.fade)
-          o.material.userData.fade.value.set(0, fade);
-      });
+      transition = T.MathUtils.smoothstep(d, 100, 145),
+      end = 1 - T.MathUtils.smoothstep(d, 320, 420);
+    const groups = [p.group, p.far];
+    const weights = [1 - transition, Math.min(transition, end)];
+    if (items.prepareGroup) {
+      for (let i = 0; i < 2; i++) {
+        const group = groups[i];
+        if (!group || weights[i] <= 0 || group.userData.pipelineReady) continue;
+        if (!group.userData.residencyRequested) {
+          group.userData.residencyRequested = true;
+          items
+            .prepareGroup(group)
+            .then(() => {
+              items.lodState = null;
+            })
+            .catch(() => {})
+            .finally(() => {
+              group.userData.residencyRequested = false;
+            });
+        }
+        if (groups[1 - i]?.userData.pipelineReady) weights[1 - i] += weights[i];
+        weights[i] = 0;
+      }
+    }
+    for (const [group, lo, hi] of [
+      [p.group, weights[1], weights[1] + weights[0]],
+      [p.far, 0, weights[1]],
+    ]) {
+      if (!group) continue;
+      group.visible = hi > lo;
+      if (group.visible && group.parent !== scene) scene.add(group);
+      else if (!group.visible && group.parent) group.removeFromParent();
+      if (group.visible)
+        group.traverse((o) => {
+          if (o.material?.userData.fade)
+            o.material.userData.fade.value.set(lo, hi);
+        });
+    }
   }
 }
 
-export async function bakeGrassGround(cache, identity, assets) {
-  const n = 512,
+// Orthographic canopy captures use the same bent cards, colours and represented
+// normals as the nearby meadow. Wrapped copies make each four-metre tile seamless.
+async function bakeGrassSurface(renderer, cache, identity, assets) {
+  const key = "grass-ground-surface:" + identity;
+  let record = await cache.get(key);
+  if (!record) {
+    const size = 512,
+      span = 4,
+      captures = [];
+    for (let k = 0; k < 3; k++) {
+      const source = new T.Group(),
+        batch = { matrices: [], colours: [], types: [] };
+      const habitat = {
+        weights: GRASS_MIXES[k],
+        density: 1,
+        height: 1,
+        tint: 0.96,
+        dry: k === 1 ? 0.6 : 0.15,
+        flow: k * 0.8,
+      };
+      const sample = () => ({
+        height: 0,
+        traffic: 0,
+        moisture: 0.5,
+        slope: 0,
+        root: 0,
+        riverDistance: 100,
+      });
+      const matrix = new T.Matrix4(),
+        q = new T.Quaternion(),
+        axis = new T.Vector3(0, 1, 0);
+      for (const p of grassPopulation(
+        0,
+        0,
+        6151 + k,
+        112,
+        span,
+        sample,
+        habitat,
+      )) {
+        for (let oz = -1; oz <= 1; oz++)
+          for (let ox = -1; ox <= 1; ox++)
+            for (let j = 0; j < 2; j++) {
+              if (
+                Math.abs(p.x + ox * span) > span / 2 + 1.2 ||
+                Math.abs(p.z + oz * span) > span / 2 + 1.2
+              )
+                continue;
+              q.setFromAxisAngle(axis, p.angle + j * Math.PI * 0.5);
+              matrix.compose(
+                new T.Vector3(p.x + ox * span, p.y, p.z + oz * span),
+                q,
+                new T.Vector3(p.sx, p.sy, p.sx),
+              );
+              batch.matrices.push(...matrix.elements);
+              batch.colours.push(...p.colour);
+              batch.types.push(p.type);
+            }
+      }
+      for (const c of Object.keys(batch)) batch[c] = new Float32Array(batch[c]);
+      source.add(grassMesh(assets, batch));
+      const baseMap = assets["ground-meadow"].map.clone();
+      baseMap.repeat.set(2.8, 2.8);
+      const base = new T.Mesh(
+        new T.PlaneGeometry(span, span),
+        new T.MeshStandardMaterial({ map: baseMap, roughness: 1 }),
+      );
+      base.rotation.x = -Math.PI / 2;
+      base.position.y = -0.045;
+      source.add(base);
+      const capture = await captureSurface(
+        renderer,
+        source,
+        new T.Vector3(),
+        span,
+        span,
+        size,
+        1,
+        cache,
+        key + ":" + k,
+        { topDown: true },
+      );
+      captures.push(capture.record);
+      capture.texture.dispose();
+      capture.normal.dispose();
+      removeLevel(source);
+      baseMap.dispose();
+      base.geometry.dispose();
+      await yieldWork();
+    }
+    const w = size * 3,
+      h = size,
+      data = new Uint8Array(w * h * 4),
+      normals = new Uint8Array(data.length);
+    for (let k = 0; k < 3; k++)
+      for (let y = 0; y < h; y++) {
+        const start = y * size * 4,
+          end = start + size * 4,
+          offset = (y * w + k * size) * 4;
+        data.set(captures[k].data.subarray(start, end), offset);
+        normals.set(captures[k].normals.subarray(start, end), offset);
+      }
+    const mips = await prepareAtlasMips({
+      data,
+      normals,
+      w,
+      h,
+      views: 3,
+      cutoff: 0,
+    });
+    record = { data, normals, w, h, views: 3, mips, topDown: true };
+    await cache.put(key, record);
+  }
+  for (const [channel, name] of [
+    ["data", "grassSurface"],
+    ["normals", "grassSurfaceNormal"],
+  ]) {
+    const t = new T.DataTexture(record[channel], record.w, record.h);
+    t.mipmaps = record.mips.map((l) => ({
+      data: l[channel],
+      width: l.width,
+      height: l.height,
+    }));
+    t.generateMipmaps = false;
+    t.minFilter = T.LinearMipmapLinearFilter;
+    t.magFilter = T.LinearFilter;
+    t.anisotropy = 8;
+    if (channel === "data") t.colorSpace = T.LinearSRGBColorSpace;
+    t.needsUpdate = true;
+    lightUniforms[name].value = t;
+  }
+  return {
+    key,
+    tileMetres: 4,
+    resolution: 512,
+    habitats: 3,
+    mips: record.mips.length,
+  };
+}
+
+export async function bakeGrassGround(renderer, cache, identity, assets) {
+  const surface = await bakeGrassSurface(renderer, cache, identity, assets);
+  const n = 1024,
     key = "grass-ground:" + identity;
   let record = await cache.get(key);
   if (!record) {
     const data = new Uint8Array(n * n * 4),
-      profile = assets.meadow.profile;
-  const tint = new T.Color(),materialTints=[new T.Color(0xe0e4b5),new T.Color(0xe0e4b5),new T.Color(0xe3e1cc)];
-    for (let z = 0; z < n; z++)
+      habitat = new Uint8Array(n * n * 4);
+    for (let z = 0; z < n; z++) {
+      if (z % 16 === 0) await yieldWork();
       for (let x = 0; x < n; x++) {
-        const wx = ((x + 0.5) / n) * TERRAIN_SIZE - TERRAIN_SIZE / 2,
-          wz = ((z + 0.5) / n) * TERRAIN_SIZE - TERRAIN_SIZE / 2,
-          s = terrainSample(wx, wz),
-          h = grassHabitat(wx, wz, s);
-        const coverage =
-          s.riverDistance < 10 || s.slope > 0.62
+        const wx = ((x + 0.5) / n - 0.5) * TERRAIN_SIZE,
+          wz = ((z + 0.5) / n - 0.5) * TERRAIN_SIZE;
+        const land = terrainSample(wx, wz),
+          h = grassHabitat(wx, wz, land),
+          i = (x + z * n) * 4;
+        const cover =
+          land.riverDistance < 8 || land.slope > 0.64
             ? 0
             : h.density *
-              (1 - T.MathUtils.smoothstep(s.traffic, 0.08, 0.37)) *
-              (1 - T.MathUtils.smoothstep(s.root, 0.08, 0.65) * 0.98);
-        const i = (x + z * n) * 4;
+              (1 - T.MathUtils.smoothstep(land.traffic, 0.08, 0.32)) *
+              (1 - T.MathUtils.smoothstep(land.root, 0.12, 0.78) * 0.94);
         for (let c = 0; c < 3; c++) {
-          // Match the material multiplier and mean instance tint of near cards.
-          tint.setHSL(.21,.20,.59+h.tint*.18+.06);
-          const component=['r','g','b'][c];
-          const meadow=profile.colour[c]*materialTints[0][component];
-          const seed=assets.grass.profile.colour[c]*materialTints[1][component];
-          const clover=assets.clover.profile.colour[c]*materialTints[2][component];
-          const mean=(meadow*(1-h.seedheads)+seed*h.seedheads)*(1-h.clover)+clover*h.clover;
-          data[i+c]=Math.round(255*mean*tint[component]);
+          let mean = 0;
+          for (let k = 0; k < GRASS_TYPES.length; k++)
+            mean +=
+              assets[GRASS_TYPES[k].name].profile.colour[c] * h.weights[k];
+          const tint =
+            h.tint *
+            (c === 1
+              ? 1.01 - h.dry * 0.025
+              : c === 2
+                ? 0.96 - h.dry * 0.05
+                : 1);
+          data[i + c] = Math.min(255, Math.round(255 * mean * tint));
         }
-        data[i + 3] = Math.round(coverage * 255);
+        data[i + 3] = Math.round(cover * 255);
+        const flower = Math.min(1, (h.weights[5] + h.weights[6]) * 3.5),
+          dry = T.MathUtils.smoothstep(h.dry, 0.22, 0.62) * (1 - flower);
+        habitat.set(
+          [
+            Math.round((1 - flower - dry) * 255),
+            Math.round(dry * 255),
+            Math.round(flower * 255),
+            255,
+          ],
+          i,
+        );
       }
-    record = { data, n };
+    }
+    record = { data, habitat, n };
     await cache.put(key, record);
   }
   const texture = new T.DataTexture(record.data, n, n, T.RGBAFormat);
@@ -621,5 +1072,17 @@ export async function bakeGrassGround(cache, identity, assets) {
   texture.colorSpace = T.LinearSRGBColorSpace;
   texture.needsUpdate = true;
   lightUniforms.grassGround.value = texture;
-  return { key, resolution: n, blockSize: 24 };
+  const mix = new T.DataTexture(record.habitat, n, n);
+  mix.minFilter = T.LinearMipmapLinearFilter;
+  mix.magFilter = T.LinearFilter;
+  mix.generateMipmaps = true;
+  mix.needsUpdate = true;
+  lightUniforms.grassHabitat.value = mix;
+  return {
+    key,
+    resolution: n,
+    surface,
+    blockSize: 24,
+    types: GRASS_TYPES.map((t) => t.name),
+  };
 }

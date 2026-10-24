@@ -10,10 +10,9 @@ import {
 import { height, random } from "./world-data.js";
 import { instanced } from "./impostors.js";
 const terrainTiles = [];
-// The camera's tile always uses 48 subdivisions; sample its actual rendered triangles.
-export function terrainCameraFloor(x, z) {
+function terrainSurface(x, z, segments) {
   const size = TERRAIN_SIZE / 32,
-    step = size / 48;
+    step = size / segments;
   const tx =
     Math.floor((x + TERRAIN_SIZE / 2) / size) * size - TERRAIN_SIZE / 2;
   const tz =
@@ -34,20 +33,69 @@ export function terrainCameraFloor(x, z) {
     u + v <= 1
       ? a + (d - a) * u + (b - a) * v
       : c + (b - c) * (1 - u) + (d - c) * (1 - v);
-  return Math.max(surface, height(x, z)) + 1.85;
+  return surface;
+}
+export function terrainCameraFloor(x, z) {
+  const size = TERRAIN_SIZE / 32;
+  const ix = Math.floor((x + TERRAIN_SIZE / 2) / size),
+    iz = Math.floor((z + TERRAIN_SIZE / 2) / size);
+  const tile =
+    ix >= 0 && ix < 32 && iz >= 0 && iz < 32
+      ? terrainTiles[ix + iz * 32]
+      : null;
+  const current = tile?.levels.find((mesh) => mesh.visible);
+  const segments = current?.geometry.parameters.widthSegments || 48;
+  // A coarse surface can remain visible while the close mesh's pages load.
+  // Keep the camera above both it and the eventual 48-subdivision replacement.
+  let surface = Math.max(terrainSurface(x, z, 48), height(x, z));
+  if (segments !== 48)
+    surface = Math.max(surface, terrainSurface(x, z, segments));
+  return surface + 1.85;
+}
+let terrainEye = null;
+let prepareTerrain = null;
+export function setTerrainPreparation(prepare) {
+  prepareTerrain = prepare;
+  for (const tile of terrainTiles)
+    for (const mesh of tile.levels)
+      if (mesh.visible) mesh.userData.pipelineReady = true;
+  terrainEye = null;
 }
 export function updateTerrain(camera) {
+  const p = camera.position;
+  if (
+    terrainEye &&
+    Math.abs(terrainEye.x - p.x) < 0.001 &&
+    Math.abs(terrainEye.z - p.z) < 0.001
+  )
+    return;
+  terrainEye = { x: p.x, z: p.z };
   for (const tile of terrainTiles) {
     const d = Math.hypot(
       camera.position.x - tile.x,
       camera.position.z - tile.z,
     );
     const level = d < 260 ? 0 : d < 850 ? 1 : 2;
+    const requested = tile.levels[level];
+    if (prepareTerrain && !requested.userData.pipelineReady) {
+      if (!requested.userData.residencyRequested) {
+        requested.userData.residencyRequested = true;
+        prepareTerrain(requested)
+          .then(() => {
+            terrainEye = null; // completed pages invalidate the distance decision
+          })
+          .catch(() => {})
+          .finally(() => {
+            requested.userData.residencyRequested = false;
+          });
+      }
+      continue; // keep the existing terrain surface until the new mesh is resident
+    }
     tile.levels.forEach((mesh, i) => (mesh.visible = i === level));
   }
 }
 export function buildEnvironment(scene, assets) {
-  lightUniforms.groundMap.value = assets["lush-ground"].map;
+  lightUniforms.groundMap.value = assets["ground-meadow"].map;
   lightUniforms.rockMap.value = assets.rock.map;
   lightUniforms.dryGroundMap.value = assets["meadow-ground"].map;
   const material = decorate(
@@ -214,7 +262,7 @@ export function buildEnvironment(scene, assets) {
       { fade: false },
     );
     const rocks = instanced(g, m, sets[k]);
-    rocks.userData.voxelKind="rock";
+    rocks.userData.voxelKind = "rock";
     rocks.castShadow = rocks.receiveShadow = true;
     scene.add(rocks);
   }

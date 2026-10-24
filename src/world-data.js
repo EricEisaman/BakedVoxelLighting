@@ -4,7 +4,9 @@ import {
   terrainSample,
   terrainSamplingGLSL,
 } from "./terrain-field.js";
-export const WORLD_VERSION = "woodland-16km-habitats-14";
+import { TREE_TYPES } from "./plant-catalog.js";
+import { patchNoise } from "./habitat.js";
+export const WORLD_VERSION = "woodland-16km-layered-species-15";
 export function random(seed) {
   return () => {
     seed |= 0;
@@ -47,24 +49,30 @@ export function makeWorld() {
             for (const p of occupied.get(`${gx + dx},${gz + dz}`) || [])
               if (Math.hypot(tx - p.x, tz - p.z) < 3.3) crowded = true;
         if (crowded) continue;
-        const grove = .5 + .5*Math.sin(tx*.009 + Math.sin(tz*.007)*2.3);
+        const grove = patchNoise(tx * 0.006, tz * 0.006, 281);
+        const species =
+          s.wetness > 0.3
+            ? rng() < 0.62
+              ? 2
+              : 1
+            : (s.upland > 0.48 && grove < 0.47) || grove > 0.81
+              ? 3
+              : s.forest > 0.55
+                ? rng() < 0.78
+                  ? 0
+                  : 2
+                : grove > 0.56
+                  ? 1
+                  : grove < 0.27
+                    ? 2
+                    : 0;
         const t = {
           x: tx,
           z: tz,
           y: s.height,
-          scale: 0.65 + rng() * 0.8,
+          scale: 0.78 + rng() * 0.48,
           rotation: rng() * Math.PI * 2,
-          variant:
-            Math.floor(rng() * 3) * 3 +
-            (s.wetness > 0.3
-              ? rng() < 0.7
-                ? 2
-                : 1
-              : s.forest > 0.55
-                ? rng() < 0.75
-                  ? 0
-                  : 2
-                : (grove > .64 ? 1 : grove < .32 ? 2 : 0)),
+          variant: Math.floor(rng() * 3) * TREE_TYPES.length + species,
           seed: Math.floor(rng() * 1e6),
         };
         const key = `${gx},${gz}`;

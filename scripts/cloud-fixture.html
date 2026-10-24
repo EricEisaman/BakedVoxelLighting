@@ -1,0 +1,90 @@
+<!doctype html>
+<html>
+  <head>
+    <link rel="icon" href="data:," />
+    <title>Cloud volume fixture</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #111;
+      }
+      canvas {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <script type="module">
+      import * as T from "three/webgpu";
+      import * as N from "three/tsl";
+      import {
+        cloudData,
+        prepareClouds,
+        updateClouds,
+        cloudStats,
+      } from "/src/clouds.js";
+      import { setShaderBackend, skyColour } from "/src/native-kernels.js";
+      import { ref, readPixels } from "/src/tsl-baking.js";
+      const renderer = new T.WebGPURenderer({
+        antialias: true,
+        forceWebGL:
+          new URLSearchParams(location.search).get("backend") === "webgl2",
+      });
+      await renderer.init();
+      setShaderBackend(renderer.backend.isWebGPUBackend);
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.toneMapping = T.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.05;
+      document.body.append(renderer.domElement);
+      const camera = new T.PerspectiveCamera(
+        55,
+        innerWidth / innerHeight,
+        0.1,
+        5000,
+      );
+      camera.position.set(25, 35, 25);
+      camera.lookAt(-70, 95, -100);
+      const U = {
+        liveSunDirection: {
+          value: new T.Vector3(-0.5, 0.78, -0.375).normalize(),
+        },
+        daylight: { value: 1 },
+        time: { value: 0 },
+      };
+      const scene = new T.Scene(),
+        m = new T.MeshBasicNodeMaterial({ side: T.BackSide });
+      const ray = N.positionWorld.sub(N.cameraPosition).normalize();
+      m.colorNode = skyColour({
+        ray,
+        sun: ref(U, "liveSunDirection", "vec3"),
+        cloud: cloudData(U, N.cameraPosition, ray),
+        daylight: ref(U, "daylight"),
+      });
+      scene.add(new T.Mesh(new T.SphereGeometry(2000, 16, 12), m));
+      const records = new Map(),
+        cache = {
+          get: async (key) => records.get(key),
+          put: async (key, data) => records.set(key, data),
+        };
+      await prepareClouds(renderer, cache, "fixture", U, camera);
+      await renderer.compileAsync(scene, camera);
+      renderer.render(scene, camera);
+      window.cloudTest = {
+        renderer,
+        camera,
+        scene,
+        U,
+        records,
+        cloudStats,
+        readPixels,
+        T,
+      };
+      window.ready = true;
+      renderer.setAnimationLoop((t) => {
+        updateClouds(renderer, t, U, camera);
+        renderer.render(scene, camera);
+      });
+    </script>
+  </body>
+</html>

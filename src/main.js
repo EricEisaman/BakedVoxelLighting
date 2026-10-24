@@ -1,27 +1,61 @@
-import {grassBakeStats,clearGrassBakes} from "./grass-jobs.js";
-import {prepareAtlasMips} from "./atlas-mips.js";
-import {advanceHour,solarState} from "./day-cycle.js";
+import { PreparedSunShadow } from "./prepared-shadows.js";
+import { getGPUUploads } from "./gpu-uploads.js";
+import {
+  prepareForRender,
+  rendererJobStats,
+  setPreparationPresenting,
+} from "./renderer-jobs.js";
+import { bakePlantAtlas } from "./plant-atlas.js";
+import {
+  TREE_TYPES,
+  SHRUB_TYPES,
+  GRASS_TYPES,
+  GRASS_LOD_DISTANCES,
+} from "./plant-catalog.js";
+import catalogSource from "./plant-catalog.js?raw";
+import habitatSource from "./habitat.js?raw";
+import plantGrowthSource from "./plant-growth.js?raw";
+import plantAtlasSource from "./plant-atlas.js?raw";
+import { grassBakeStats, clearGrassBakes } from "./grass-jobs.js";
+import { prepareAtlasMips } from "./atlas-mips.js";
+import { advanceHour, solarState } from "./day-cycle.js";
 import { indexVoxelWorld } from "./voxel-index.js";
-import {cloudAt, updateClouds, getCloudTarget} from "./clouds.js";
+import {
+  cloudAt,
+  cloudData,
+  updateClouds,
+  getCloudTarget,
+  prepareClouds,
+  cloudStats,
+  CLOUD_SHADOW_STRENGTH,
+} from "./clouds.js";
 import { createAtmosphere } from "./atmosphere.js";
 import * as N from "three/tsl";
-import { cloudDensity } from "./native-kernels.js";
+import cloudKernelSource from "./cloud-kernels.js?raw";
+import cloudDensityGLSL from "./shaders/cloud-density.glsl?raw";
+import cloudDensityWGSL from "./shaders/cloud-density.wgsl?raw";
+import { skyColour } from "./native-kernels.js";
 import { ref } from "./tsl-baking.js";
 import grassWorkerSource from "./grass-worker.js?raw";
-import {buildVoxelDetailsAsync} from "./voxel-details.js";
-import {finishGrassJobs} from "./vegetation.js";
+import { buildVoxelDetailsAsync, voxelWorkerStats } from "./voxel-details.js";
+import { finishGrassJobs } from "./vegetation.js";
 import atlasWorkerSource from "./atlas-worker.js?raw";
 import { setShaderBackend, nativeVolumeSource } from "./native-kernels.js";
 import nativeSource from "./native-kernels.js?raw";
 import { VoxelSun, installVoxelSun } from "./tsl-sun.js";
 import tslBakeSource from "./tsl-baking.js?raw";
 import tslMaterialSource from "./tsl-materials.js?raw";
-import { buildVoxelDetails } from "./voxel-details.js";
-import detailSource from "./voxel-details.js?raw";
+import detailSource from "./voxel-core.js?raw";
+import voxelWorkerSource from "./voxel-worker.js?raw";
+import grassDataSource from "./grass-data.js?raw";
+import terrainMathSource from "./terrain-math.js?raw";
+import terrainSnapshotSource from "./terrain-snapshot.js?raw";
+import mergedDataSource from "./merged-data.js?raw";
 import { FrameClock, dampingAtDelta } from "./frame-clock.js";
 import {
   updateMergedVisibility,
   mergedStats,
+  mergedWorkerStats,
   clearMergedCache,
 } from "./merged-visibility.js";
 import mergedSource from "./merged-visibility.js?raw";
@@ -66,12 +100,14 @@ import {
   bakeGrassGround,
   updateLOD,
   buildShrubs,
+  bakeShrubLOD,
   updateShrubs,
 } from "./vegetation.js";
 import {
   buildEnvironment,
   updateTerrain,
   terrainCameraFloor,
+  setTerrainPreparation,
 } from "./environment.js";
 const $ = (id) => document.getElementById(id);
 const diagnostics = (window.worldDiagnostics = {
@@ -113,6 +149,11 @@ const renderer = new T.WebGPURenderer({
   powerPreference: "high-performance",
 });
 await renderer.init();
+const gpuUploads = getGPUUploads(renderer);
+diagnostics.preparation = {
+  uploads: gpuUploads.stats,
+  renderer: rendererJobStats,
+};
 setShaderBackend(!!renderer.backend.isWebGPUBackend);
 // This forest has thousands of differently sized instanced batches. Prefer
 // instance attributes over count-sized uniform arrays so each batch count does
@@ -149,7 +190,9 @@ const scene = new T.Scene();
 // every colour and shadow pass was the dominant CPU regression.
 scene.matrixWorldAutoUpdate = false;
 scene.updateMatrixWorld(true);
-scene.addEventListener('childadded', ({child}) => child.updateMatrixWorld(true));
+scene.addEventListener("childadded", ({ child }) =>
+  child.updateMatrixWorld(true),
+);
 scene.background = new T.Color(0xadc9df);
 scene.fog = null;
 const camera = new T.PerspectiveCamera(
@@ -175,8 +218,10 @@ controls.maxDistance = 1000;
 const sun = new VoxelSun(0xffe6be, 2.6),
   ambient = new T.HemisphereLight(0xc9dded, 0x666546, 0.85);
 sun.castShadow = true;
+const preparedSunShadow = new PreparedSunShadow(sun);
+sun.shadow.shadowNode = preparedSunShadow;
 sun.shadow.autoUpdate = false;
-let lastSunShadowUpdate=-Infinity;
+let lastSunShadowUpdate = -Infinity;
 sun.shadow.mapSize.set(2048, 2048);
 Object.assign(sun.shadow.camera, {
   left: -65,
@@ -207,34 +252,76 @@ sky.scale.setScalar(7000);
 sky.frustumCulled = false;
 sky.cloudCoverage.value = 0;
 sky.showSunDisc.value = 0;
-const cloudMask = cloudAt(lightUniforms,N.cameraPosition,N.positionWorld.sub(N.cameraPosition).normalize());
-// A cheap sky gradient keeps the cloud silhouette readable and avoids the
-// former per-pixel atmospheric/cloud procedural graph.
-const skyDirection=N.positionWorld.sub(N.cameraPosition).normalize();
-const clearSky=N.vec4(N.mix(N.vec3(.53,.66,.78),N.vec3(.045,.20,.48),N.pow(N.max(skyDirection.y,0),.4)),1);
-const daylightNode=ref(lightUniforms,'daylight');
-sky.material.colorNode=N.vec4(N.mix(N.vec3(.003,.006,.016),N.mix(clearSky.rgb,N.vec3(.90,.92,.92).sub(cloudMask.mul(.25)),cloudMask.mul(.95)),daylightNode),1);
-const discMaterial=new T.MeshBasicNodeMaterial({depthWrite:false,transparent:true});
-discMaterial.colorNode=N.vec3(12,9,5);
-discMaterial.opacityNode=N.float(1).sub(cloudAt(lightUniforms,N.cameraPosition,ref(lightUniforms,'liveSunDirection','vec3')).mul(.9));
-const sunDisc=new T.Mesh(new T.SphereGeometry(14,24,12),discMaterial);
-sunDisc.frustumCulled=false;scene.add(sunDisc);
-let worldHour=8.133333,cycleRunning=true,lastCycleTime=null,lastCycleLight=-Infinity;
-function applySolar(){
- const state=solarState(worldHour);sunDirection.fromArray(state.direction).normalize();
- lightUniforms.daylight.value=state.daylight;
- sun.intensity=2.6*state.daylight;ambient.intensity=.025+.825*state.daylight;
- sky.sunPosition.value.copy(sunDirection);lightUniforms.liveSunDirection.value.copy(sunDirection);
- sunDisc.visible=sunDirection.y>-.015;
- diagnostics.sun={direction:sunDirection.toArray(),hour:worldHour,daylight:state.daylight,angularDiameterDegrees:.535,cloudHeight:650};
- $('lookSun').disabled=sunDirection.y<=0;
- $('sunValue').textContent=`${state.elevation.toFixed(0)}°`;
- $('clockValue').textContent=`${String(Math.floor(worldHour)).padStart(2,'0')}:${String(Math.floor(worldHour%1*60)).padStart(2,'0')}`;
- $('timeOfDay').value=worldHour;
+const skyDirection = N.positionWorld.sub(N.cameraPosition).normalize();
+sky.material.colorNode = N.vec4(
+  skyColour({
+    ray: skyDirection,
+    sun: ref(lightUniforms, "liveSunDirection", "vec3"),
+    cloud: cloudData(lightUniforms, N.cameraPosition, skyDirection),
+    daylight: ref(lightUniforms, "daylight"),
+  }),
+  1,
+);
+const discMaterial = new T.MeshBasicNodeMaterial({
+  depthWrite: false,
+  transparent: true,
+});
+discMaterial.colorNode = N.vec3(12, 9, 5);
+discMaterial.opacityNode = N.float(1).sub(
+  cloudData(
+    lightUniforms,
+    N.cameraPosition,
+    ref(lightUniforms, "liveSunDirection", "vec3"),
+  ).a,
+);
+const sunDisc = new T.Mesh(new T.SphereGeometry(14, 24, 12), discMaterial);
+sunDisc.frustumCulled = false;
+scene.add(sunDisc);
+let worldHour = 8.133333,
+  cycleRunning = true,
+  lastCycleTime = null,
+  lastCycleLight = -Infinity;
+function applySolar() {
+  const state = solarState(worldHour);
+  sunDirection.fromArray(state.direction).normalize();
+  lightUniforms.daylight.value = state.daylight;
+  sun.intensity = 2.6 * state.daylight;
+  ambient.intensity = 0.025 + 0.825 * state.daylight;
+  sun.color.setRGB(
+    1,
+    0.73 + 0.23 * Math.max(0, sunDirection.y),
+    0.46 + 0.43 * Math.max(0, sunDirection.y),
+  );
+  sky.sunPosition.value.copy(sunDirection);
+  lightUniforms.liveSunDirection.value.copy(sunDirection);
+  sunDisc.visible = sunDirection.y > -0.015;
+  diagnostics.sun = {
+    direction: sunDirection.toArray(),
+    hour: worldHour,
+    daylight: state.daylight,
+    angularDiameterDegrees: 0.535,
+    cloudHeight: 650,
+  };
+  $("lookSun").disabled = sunDirection.y <= 0;
+  $("sunValue").textContent = `${state.elevation.toFixed(0)}°`;
+  $("clockValue").textContent =
+    `${String(Math.floor(worldHour)).padStart(2, "0")}:${String(Math.floor((worldHour % 1) * 60)).padStart(2, "0")}`;
+  $("timeOfDay").value = worldHour;
 }
-$('lookSun').onclick=()=>{const p=camera.position.clone();controls.target.copy(p).addScaledVector(sunDirection,100);controls.update();};
-$('dayCycle').onchange=e=>{cycleRunning=e.target.checked;};
-$('timeOfDay').oninput=e=>{worldHour=Number(e.target.value);applySolar();lightDirty=true;updateSunShadow(true);};
+$("lookSun").onclick = () => {
+  const p = camera.position.clone();
+  controls.target.copy(p).addScaledVector(sunDirection, 100);
+  controls.update();
+};
+$("dayCycle").onchange = (e) => {
+  cycleRunning = e.target.checked;
+};
+$("timeOfDay").oninput = (e) => {
+  worldHour = Number(e.target.value);
+  applySolar();
+  lightDirty = true;
+  updateSunShadow(true);
+};
 sky.turbidity.value = 1.5;
 sky.rayleigh.value = 2;
 sky.mieCoefficient.value = 0.0003;
@@ -247,14 +334,19 @@ function setSun(degrees) {
     .normalize();
   sky.sunPosition.value.copy(sunDirection);
   lightUniforms.liveSunDirection.value.copy(sunDirection);
-  diagnostics.sun = { direction: sunDirection.toArray(), angularDiameterDegrees: .53, cloudHeight:650, maximumCloudAttenuation:.48 };
+  diagnostics.sun = {
+    direction: sunDirection.toArray(),
+    angularDiameterDegrees: 0.53,
+    cloudHeight: 650,
+    maximumCloudAttenuation: CLOUD_SHADOW_STRENGTH,
+  };
   updateSunShadow(true);
 }
-function updateSunShadow(force=false) {
-  const now=performance.now();
-  if(!force && now-lastSunShadowUpdate<50)return;
-  lastSunShadowUpdate=now;
-  sun.shadow.needsUpdate=true;
+function updateSunShadow(force = false) {
+  const now = performance.now();
+  if (!force && now - lastSunShadowUpdate < 50) return;
+  lastSunShadowUpdate = now;
+  sun.shadow.needsUpdate = true;
   sun.target.position.set(
     camera.position.x,
     height(camera.position.x, camera.position.z),
@@ -357,8 +449,11 @@ $("view").onclick = () => {
 };
 $("sun").oninput = () => {
   $("sunValue").textContent = $("sun").value + "°";
-  cycleRunning=false;$("dayCycle").checked=false;
-  worldHour=6+Number($("sun").value)/15;applySolar();updateSunShadow(true);
+  cycleRunning = false;
+  $("dayCycle").checked = false;
+  worldHour = 6 + Number($("sun").value) / 15;
+  applySolar();
+  updateSunShadow(true);
   lightDirty = true;
   $("status").textContent = "Live sun · GPU radiance updating";
 };
@@ -407,8 +502,13 @@ async function bake() {
   $("clear").disabled = true;
   const start = performance.now();
   try {
-    const areaX=Math.round(camera.position.x/64)*64,areaZ=Math.round(camera.position.z/64)*64;
-    volumeMin.set(areaX-128,Math.floor(height(areaX,areaZ)/8)*8-16,areaZ-128);
+    const areaX = Math.round(camera.position.x / 64) * 64,
+      areaZ = Math.round(camera.position.z / 64) * 64;
+    volumeMin.set(
+      areaX - 128,
+      Math.floor(height(areaX, areaZ) / 8) * 8 - 16,
+      areaZ - 128,
+    );
     const n = Number($("resolution").value);
     const result = await bakeVolume(
       renderer,
@@ -428,6 +528,7 @@ async function bake() {
       progress,
     );
     await bakeGrassLOD(renderer, grass, [], cache, surfaceIdentity, progress);
+    await bakeShrubLOD(renderer, shrubs, cache, surfaceIdentity);
     diagnostics.bakes.push({
       ...result,
       totalMs: performance.now() - start,
@@ -440,6 +541,8 @@ async function bake() {
     diagnostics.clusterCount = clusters.length;
     diagnostics.grassPatchCount = grass.patches.length;
     diagnostics.growth = clusters.prototypes.map((p) => ({
+      species: p.speciesName,
+      age: p.age,
       segments: p.segments.length,
       leafCards: p.leaves.length,
       highTriangles: p.high.index.count / 3,
@@ -476,6 +579,14 @@ const assetNames = [
   "bark-birch",
   "bark-ash",
   "lush-ground",
+  "meadow-long",
+  "meadow-seeds",
+  "flowers-yellow",
+  "flowers-purple",
+  "hazel",
+  "bramble",
+  "pine",
+  "ground-meadow",
 ];
 async function loadAssets() {
   const assets = {},
@@ -483,11 +594,12 @@ async function loadAssets() {
     loader = new T.TextureLoader();
   for (const name of assetNames) {
     progress(`Loading ${name} surface`, 0.01);
-    const response = await fetch(`/textures/${name}.png`);
+    const textureUrl = `${import.meta.env.BASE_URL}textures/${name}.png`;
+    const response = await fetch(textureUrl);
     if (!response.ok) throw Error(`Missing ${name}`);
     const hash = await digest(await response.arrayBuffer());
     hashes.push(hash);
-    let map = await loader.loadAsync(`/textures/${name}.png`);
+    let map = await loader.loadAsync(textureUrl);
     map.colorSpace = T.SRGBColorSpace;
     map.anisotropy = Math.min(16, renderer.getMaxAnisotropy());
     if (
@@ -499,6 +611,7 @@ async function loadAssets() {
         "rock",
         "meadow-ground",
         "lush-ground",
+        "ground-meadow",
       ].includes(name)
     ) {
       map.wrapS = map.wrapT = T.RepeatWrapping;
@@ -507,7 +620,7 @@ async function loadAssets() {
         name.startsWith("bark") ? 3 : name === "rock" ? 1 : 220,
       );
     }
-    const key = "normal-native-v3:" + await digest(hash + nativeSource);
+    const key = "normal-native-v3:" + (await digest(hash + nativeSource));
     let record = await cache.get(key);
     if (!record) {
       const source = map.clone();
@@ -547,30 +660,91 @@ async function loadAssets() {
     for (let i = 0; i < pixels.length; i += 4) {
       const a = pixels[i + 3] / 255;
       coverage += a;
-      linear.setRGB(pixels[i]/255,pixels[i+1]/255,pixels[i+2]/255,T.SRGBColorSpace);
-      r += linear.r * a; g += linear.g * a; b += linear.b * a;
+      linear.setRGB(
+        pixels[i] / 255,
+        pixels[i + 1] / 255,
+        pixels[i + 2] / 255,
+        T.SRGBColorSpace,
+      );
+      r += linear.r * a;
+      g += linear.g * a;
+      b += linear.b * a;
     }
     const colour = new T.Color(
       r / Math.max(coverage, 1),
       g / Math.max(coverage, 1),
       b / Math.max(coverage, 1),
     );
-    const mipKey='source-mips-v2:'+await digest(hash+atlasWorkerSource);
-    let mipRecord=await cache.get(mipKey);
-    if(!mipRecord){
-      sampleCanvas.width=map.image.width;sampleCanvas.height=map.image.height;
-      ctx.drawImage(map.image,0,0);const raw=ctx.getImageData(0,0,sampleCanvas.width,sampleCanvas.height).data;
-      const data=new Uint8Array(raw.length),stride=sampleCanvas.width*4;
-      for(let y=0;y<sampleCanvas.height;y++)data.set(raw.subarray(y*stride,(y+1)*stride),(sampleCanvas.height-1-y)*stride);
-      mipRecord=await prepareAtlasMips({w:sampleCanvas.width,h:sampleCanvas.height,views:1,data,normals:record.data,srgb:true,cutoff:['oak','birch','ash'].includes(name)?103:87});
-      await cache.put(mipKey,mipRecord);
+    const mipKey = "source-mips-v2:" + (await digest(hash + atlasWorkerSource));
+    let mipRecord = await cache.get(mipKey);
+    if (!mipRecord) {
+      sampleCanvas.width = map.image.width;
+      sampleCanvas.height = map.image.height;
+      ctx.drawImage(map.image, 0, 0);
+      const raw = ctx.getImageData(
+        0,
+        0,
+        sampleCanvas.width,
+        sampleCanvas.height,
+      ).data;
+      const data = new Uint8Array(raw.length),
+        stride = sampleCanvas.width * 4;
+      for (let y = 0; y < sampleCanvas.height; y++)
+        data.set(
+          raw.subarray(y * stride, (y + 1) * stride),
+          (sampleCanvas.height - 1 - y) * stride,
+        );
+      mipRecord = await prepareAtlasMips({
+        w: sampleCanvas.width,
+        h: sampleCanvas.height,
+        views: 1,
+        data,
+        normals: record.data,
+        srgb: true,
+        cutoff: ["oak", "birch", "ash", "pine", "hazel", "bramble"].includes(
+          name,
+        )
+          ? 103
+          : 87,
+      });
+      await cache.put(mipKey, mipRecord);
     }
-    const bakedMap=new T.DataTexture(mipRecord[0].data,map.image.width,map.image.height,T.RGBAFormat);
-    bakedMap.colorSpace=T.SRGBColorSpace;bakedMap.wrapS=map.wrapS;bakedMap.wrapT=map.wrapT;bakedMap.repeat.copy(map.repeat);bakedMap.anisotropy=map.anisotropy;
-    bakedMap.mipmaps=mipRecord.map(l=>({data:l.data,width:l.width,height:l.height}));bakedMap.generateMipmaps=false;bakedMap.minFilter=T.LinearMipmapLinearFilter;bakedMap.magFilter=T.LinearFilter;bakedMap.needsUpdate=true;
-    normal.mipmaps=mipRecord.map(l=>({data:l.normals,width:l.width,height:l.height}));normal.generateMipmaps=false;normal.needsUpdate=true;
-    map.dispose();map=bakedMap;
-    const tail=mipRecord.at(-1).data;colour.setRGB(tail[0]/255,tail[1]/255,tail[2]/255,T.SRGBColorSpace);
+    const bakedMap = new T.DataTexture(
+      mipRecord[0].data,
+      map.image.width,
+      map.image.height,
+      T.RGBAFormat,
+    );
+    bakedMap.colorSpace = T.SRGBColorSpace;
+    bakedMap.wrapS = map.wrapS;
+    bakedMap.wrapT = map.wrapT;
+    bakedMap.repeat.copy(map.repeat);
+    bakedMap.anisotropy = map.anisotropy;
+    bakedMap.mipmaps = mipRecord.map((l) => ({
+      data: l.data,
+      width: l.width,
+      height: l.height,
+    }));
+    bakedMap.generateMipmaps = false;
+    bakedMap.minFilter = T.LinearMipmapLinearFilter;
+    bakedMap.magFilter = T.LinearFilter;
+    bakedMap.needsUpdate = true;
+    normal.mipmaps = mipRecord.map((l) => ({
+      data: l.normals,
+      width: l.width,
+      height: l.height,
+    }));
+    normal.generateMipmaps = false;
+    normal.needsUpdate = true;
+    map.dispose();
+    map = bakedMap;
+    const tail = mipRecord.at(-1).data;
+    colour.setRGB(
+      tail[0] / 255,
+      tail[1] / 255,
+      tail[2] / 255,
+      T.SRGBColorSpace,
+    );
     assets[name] = {
       map,
       normal,
@@ -585,26 +759,47 @@ async function loadAssets() {
     };
   }
   assetHash = await digest(
-    nativeSource + nativeVolumeSource + tslBakeSource +
+    catalogSource +
+      habitatSource +
+      plantGrowthSource +
+      plantAtlasSource +
+      nativeSource +
+      nativeVolumeSource +
+      tslBakeSource +
       tslMaterialSource +
       hashes.join("") +
       lightingSource +
       worldSource +
       terrainSource +
+      terrainMathSource +
+      terrainSnapshotSource +
       vegetationSource +
-      detailSource,
+      detailSource +
+      voxelWorkerSource,
   );
   surfaceIdentity = await digest(
-    "native-surfaces-v4:" + grassWorkerSource + atlasWorkerSource +
-      nativeSource + nativeVolumeSource + tslBakeSource +
+    "layered-surfaces-v5:" +
+      catalogSource +
+      habitatSource +
+      plantGrowthSource +
+      plantAtlasSource +
+      grassWorkerSource +
+      grassDataSource +
+      atlasWorkerSource +
+      nativeSource +
+      nativeVolumeSource +
+      tslBakeSource +
       tslMaterialSource +
       hashes.join("") +
       vegetationSource +
       growthSource +
       worldSource +
       terrainSource +
+      terrainMathSource +
+      terrainSnapshotSource +
       impostorSource +
-      mergedSource,
+      mergedSource +
+      mergedDataSource,
   );
   return assets;
 }
@@ -634,10 +829,16 @@ function animate(now) {
   }
   const cpuStart = performance.now();
   lightUniforms.time.value = now / 1000;
-  if(lastCycleTime!==null && cycleRunning)worldHour=advanceHour(worldHour,(now-lastCycleTime)/1000);
-  lastCycleTime=now;applySolar();
-  if(cycleRunning && now-lastCycleLight>2000){lightDirty=true;lastCycleLight=now;}
-  sunDisc.position.copy(camera.position).addScaledVector(sunDirection,3000);sunDisc.updateMatrixWorld();
+  if (lastCycleTime !== null && cycleRunning)
+    worldHour = advanceHour(worldHour, (now - lastCycleTime) / 1000);
+  lastCycleTime = now;
+  applySolar();
+  if (cycleRunning && now - lastCycleLight > 2000) {
+    lightDirty = true;
+    lastCycleLight = now;
+  }
+  sunDisc.position.copy(camera.position).addScaledVector(sunDirection, 3000);
+  sunDisc.updateMatrixWorld();
   if (walking) {
     camera.rotation.order = "YXZ";
     camera.rotation.set(pitch, yaw, 0);
@@ -694,7 +895,11 @@ function animate(now) {
     lamp.updateMatrixWorld();
     lampOrb.updateMatrixWorld();
   }
-  if (!diagnostics.baking && (dynamic || lightDirty) && now - lastLighting > 180) {
+  if (
+    !diagnostics.baking &&
+    (dynamic || lightDirty) &&
+    now - lastLighting > 180
+  ) {
     refreshLighting(renderer, sunDirection, lamp.position, dynamic ? 700 : 0);
     lastLighting = now;
     lightDirty = false;
@@ -710,7 +915,7 @@ function animate(now) {
     grass.patches,
     camera,
     forcedGrass,
-    [34, 70, 135],
+    GRASS_LOD_DISTANCES,
     scene,
   );
   updateShrubs(shrubs, camera, scene);
@@ -718,8 +923,15 @@ function animate(now) {
   updateMergedVisibility(clusters, camera, scene);
   diagnostics.mergedVisibility = mergedStats;
   diagnostics.grassBake = grassBakeStats;
+  diagnostics.preparation = {
+    voxel: voxelWorkerStats,
+    merged: mergedWorkerStats,
+    renderer: rendererJobStats,
+    shadows: preparedSunShadow.stats,
+    uploads: gpuUploads.stats,
+  };
   renderer.info.reset();
-  updateClouds(renderer,now);
+  updateClouds(renderer, now, lightUniforms, camera);
   composer.render();
   frameClock.end(performance.now() - cpuStart);
   if (now - frameTime > 250) {
@@ -758,6 +970,7 @@ window.addEventListener("resize", () => {
   composer.setSize(innerWidth, innerHeight);
 });
 window.worldTest = {
+  terrainCameraFloor,
   getCloudTarget,
   camera,
   controls,
@@ -781,25 +994,80 @@ window.worldTest = {
 async function start() {
   await cache.open();
   const assets = await loadAssets();
+  progress("Baking cloud density and sunlight", 0.015);
+  await prepareClouds(
+    renderer,
+    cache,
+    await digest(cloudKernelSource + cloudDensityGLSL + cloudDensityWGSL),
+    lightUniforms,
+    camera,
+  );
+  diagnostics.clouds = cloudStats;
+  progress("Baking shared meadow atlas", 0.02);
+  diagnostics.plants = {
+    trees: TREE_TYPES,
+    shrubs: SHRUB_TYPES,
+    grass: GRASS_TYPES.map((t) => t.name),
+  };
+  diagnostics.grassPalette = await bakePlantAtlas(
+    assets,
+    cache,
+    surfaceIdentity,
+  );
   diagnostics.environment = buildEnvironment(scene, assets);
   diagnostics.environment = { rocks: diagnostics.environment.rocks };
   clusters = buildTrees(world, assets);
   grass = buildGrass(assets);
-  grass.prepare = async group => {
+  clusters.prepareGroup = (group) => {
+    if (group.userData.pipelineReady) return Promise.resolve();
+    if (group.userData.preparation) return group.userData.preparation;
+    group.userData.preparation = (async () => {
+      for (const mesh of group.isMesh ? [group] : group.children)
+        await prepareForRender(
+          renderer,
+          mesh,
+          camera,
+          scene,
+          composer.sceneTarget,
+          null,
+          1,
+        );
+      await preparedSunShadow.prepare(renderer, group, scene);
+      group.userData.pipelineReady = true;
+      clusters.lodRevision = (clusters.lodRevision || 0) + 1;
+    })().catch((error) => {
+      group.userData.preparation = null;
+      fail(error);
+      throw error;
+    });
+    return group.userData.preparation;
+  };
+  grass.prepare = async (group) => {
     group.updateMatrixWorld(true);
-    for(const mesh of group.children){
-      await renderer.compileAsync(mesh,camera,scene);
-      if(loopStarted) await new Promise(resolve=>setTimeout(resolve,0));
+    for (const mesh of group.children) {
+      await prepareForRender(
+        renderer,
+        mesh,
+        camera,
+        scene,
+        composer.sceneTarget,
+        null,
+        1,
+      );
+      if (loopStarted) await new Promise((resolve) => setTimeout(resolve, 0));
     }
   };
   diagnostics.grassGround = await bakeGrassGround(
+    renderer,
     cache,
     surfaceIdentity,
     assets,
   );
   shrubs = buildShrubs(world, assets);
   world.materialProfiles = Object.fromEntries(
-    Object.entries(assets).map(([k, v]) => [k, v.profile]),
+    Object.entries(assets)
+      .filter(([, v]) => v.profile)
+      .map(([k, v]) => [k, v.profile]),
   );
   world.grassBake = grass;
   world.surfaceIdentity = surfaceIdentity;
@@ -825,21 +1093,26 @@ async function start() {
     if (c.center.distanceTo(camera.position) < 180) scene.add(c.levels[0]);
   });
   diagnostics.areaIndexes = indexVoxelWorld(world);
-  world.bakeIdentity = await digest(assetHash + surfaceIdentity + JSON.stringify(world.trees));
+  world.bakeIdentity = await digest(
+    assetHash + surfaceIdentity + JSON.stringify(world.trees),
+  );
   await bake();
   if (!diagnostics.ready) return;
   baking = true;
   diagnostics.baking = true;
   progress("Preparing scene shaders", 0.98);
   controls.update();
+  const prepareGroup = clusters.prepareGroup;
+  clusters.prepareGroup = null;
   updateLOD(clusters, camera, forcedTree, [85, 190, 420], scene);
-  updateLOD(grass.patches, camera, forcedGrass, [34, 70, 135], scene);
+  clusters.prepareGroup = prepareGroup;
+  updateLOD(grass.patches, camera, forcedGrass, GRASS_LOD_DISTANCES, scene);
   updateShrubs(shrubs, camera, scene);
   updateTerrain(camera);
   await finishGrassJobs();
-  updateLOD(grass.patches,camera,forcedGrass,[34,70,135],scene);
-  // Prepare only initially visible far clusters before compiling thousands of
-  // temporary unmerged materials. Later camera turns still bake on demand.
+  updateLOD(grass.patches, camera, forcedGrass, GRASS_LOD_DISTANCES, scene);
+  // Merge the starting distance ring in every direction before presentation.
+  // Translation into another ring can still request additional merges.
   for (let i = 0; i < clusters.length; i++) {
     const job = updateMergedVisibility(clusters, camera, scene, true);
     if (!job) break;
@@ -852,28 +1125,43 @@ async function start() {
   updateMergedVisibility(clusters, camera, scene);
   // Warm the active distance rings in every direction. Frustum-limited compilation
   // made a camera turn synchronously build hundreds of first-use materials.
-  const culled=[];
-  scene.traverse(o=>{if(o.isMesh){culled.push([o,o.frustumCulled]);o.frustumCulled=false;}});
+  const culled = [];
+  scene.traverse((o) => {
+    if (o.isMesh) {
+      culled.push([o, o.frustumCulled]);
+      o.frustumCulled = false;
+    }
+  });
   try {
-    await renderer.compileAsync(scene, camera, null, ({ loaded, total }) => {
-      if (loaded % 32 === 0 || loaded === total)
-        progress(`Preparing scene shaders ${loaded}/${total}`, 0.98);
-    });
-  } finally {for(const [object,value] of culled)object.frustumCulled=value;}
-  clusters.forEach(c=>c.levels.forEach(g=>{if(g?.visible)g.userData.pipelineReady=true;}));
-  let preparation=Promise.resolve();
-  clusters.prepareGroup=group=>{
-    if(group.userData.compiling)return;
-    group.userData.compiling=true;
-    preparation=preparation.then(async()=>{
-      group.updateMatrixWorld(true);
-      for(const mesh of group.children){await renderer.compileAsync(mesh,camera,scene);await new Promise(resolve=>setTimeout(resolve,0));}
-      group.userData.pipelineReady=true;
-    }).catch(fail).finally(()=>{group.userData.compiling=false;});
-  };
+    await prepareForRender(
+      renderer,
+      scene,
+      camera,
+      scene,
+      composer.sceneTarget,
+      null,
+      1,
+    );
+  } finally {
+    for (const [object, value] of culled) object.frustumCulled = value;
+  }
+  await preparedSunShadow.prepare(renderer, scene, scene);
+  // Newly selected terrain and shrub meshes use the same page/pipeline gate as
+  // trees. Previously these LOD switches could bypass the preparation queue.
+  scene.traverseVisible((object) => {
+    object.userData.pipelineReady = true;
+  });
+  setTerrainPreparation(clusters.prepareGroup);
+  shrubs.prepareGroup = clusters.prepareGroup;
+  clusters.forEach((c) =>
+    c.levels.forEach((g) => {
+      if (g?.visible) g.userData.pipelineReady = true;
+    }),
+  );
   baking = false;
   diagnostics.baking = false;
   progress(`16 km² · ${world.trees.length} trees · ready`, 1);
+  setPreparationPresenting(true);
   loopStarted = true;
   scheduleFrame();
 }
