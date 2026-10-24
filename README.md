@@ -414,3 +414,9 @@ manually. No tests run in Actions. To preview the same subdirectory build locall
 run `npm run build:pages`, then `npm run preview -- --base /BakedVoxelLighting/`
 and open `http://127.0.0.1:4173/BakedVoxelLighting/`. This is an experimental
 desktop renderer; the streaming/performance limitations above remain open.
+
+WebGL2 index buffers are initialized as element buffers before their payload is
+paged through the copy target. This fixes missing terrain, trees and sky on
+backends that reject indexed draws from untyped copied buffers. The upload check
+also verifies rendered coverage and GL errors; buffer byte equality alone did
+not catch this failure.

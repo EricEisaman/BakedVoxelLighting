@@ -170,10 +170,18 @@ class PagedUploads {
             this._createBuffer = (gl, type, array, hint) => {
               const buffer = manager.allocation(() => {
                 const b = gl.createBuffer();
-                // COPY_WRITE_BUFFER avoids mutating a currently cached VAO's index binding.
-                gl.bindBuffer(gl.COPY_WRITE_BUFFER, b);
-                gl.bufferData(gl.COPY_WRITE_BUFFER, array.byteLength, hint);
-                gl.bindBuffer(gl.COPY_WRITE_BUFFER, null);
+                // Establish an element buffer before filling it through the copy
+                // target. Otherwise indexed draws can fail WebGL validation even
+                // though the copied bytes read back correctly. Detach the cached
+                // VAO first so allocation cannot replace its element binding.
+                const target = type === gl.ELEMENT_ARRAY_BUFFER
+                  ? gl.ELEMENT_ARRAY_BUFFER
+                  : gl.COPY_WRITE_BUFFER;
+                if (target === gl.ELEMENT_ARRAY_BUFFER)
+                  backend.state.resetVertexState();
+                gl.bindBuffer(target, b);
+                gl.bufferData(target, array.byteLength, hint);
+                gl.bindBuffer(target, null);
                 return b;
               });
               const job = manager.queue.enqueue(

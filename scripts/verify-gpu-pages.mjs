@@ -188,6 +188,14 @@ try {
         const target = new T.RenderTarget(128, 64);
         renderer.setRenderTarget(target);
         renderer.render(scene, camera);
+        const indexedDrawError = renderer.backend.isWebGPUBackend
+          ? 0 : renderer.backend.gl.getError();
+        const indexedPixels = new Uint8Array(128 * 64 * 4);
+        await readPixels(renderer, target, 0, 0, 128, 64, indexedPixels);
+        let indexedDrawPixels = 0;
+        for (let i = 0; i < indexedPixels.length; i += 4)
+          if (indexedPixels[i] + indexedPixels[i + 1] + indexedPixels[i + 2] > 30)
+            indexedDrawPixels++;
         renderer.setRenderTarget(null);
         const firstDrawExtraBytes = {
           buffers: manager.stats.unpagedBufferBytes - beforeDraw.buffers,
@@ -230,6 +238,8 @@ try {
           frames,
           comparisons,
           attributeParity,
+          indexedDrawError,
+          indexedDrawPixels,
           firstDrawExtraBytes,
           cancellation,
           partialBytes,
@@ -274,6 +284,8 @@ try {
       { buffers: 0, textures: 0 },
       "first draw must reuse prepared uploads",
     );
+    assert.equal(r.indexedDrawError, 0, "paged indexed geometry must draw without GL errors");
+    assert.ok(r.indexedDrawPixels > 128 * 64 * 0.9, "indexed draw must cover the target, not just pass byte readback");
     assert.equal(r.cancellation, "AbortError");
     assert.equal(r.partialCancellation, "AbortError");
     assert.ok(r.partialBytes > 0 && r.partialBytes < 4 * 1024 * 1024);
