@@ -388,23 +388,34 @@ const keys = new Set();
 let walking = false,
   yaw = 0,
   pitch = 0;
-$("explore").onclick = () => {
+function resumeOrbit(keepExploring = false) {
+  walking = false;
+  document.body.classList.toggle("exploring", keepExploring);
+  controls.enabled = true;
+  controls.target
+    .copy(camera.position)
+    .addScaledVector(camera.getWorldDirection(new T.Vector3()), 15);
+}
+$("explore").onclick = async () => {
   walking = true;
   document.body.classList.add("exploring");
   controls.enabled = false;
   const d = camera.getWorldDirection(new T.Vector3());
   yaw = Math.atan2(-d.x, -d.z);
   pitch = Math.asin(d.y);
-  renderer.domElement.requestPointerLock?.();
+  // Mouse capture can be denied in embedded previews or an inactive tab.
+  // Keep the loaded world usable with drag/scroll controls in that case.
+  if (!renderer.domElement.requestPointerLock) return resumeOrbit(true);
+  try {
+    await renderer.domElement.requestPointerLock();
+  } catch {
+    resumeOrbit(true);
+  }
 };
+document.addEventListener("pointerlockerror", () => resumeOrbit(true));
 document.addEventListener("pointerlockchange", () => {
   if (document.pointerLockElement !== renderer.domElement) {
-    walking = false;
-    document.body.classList.remove("exploring");
-    controls.enabled = true;
-    controls.target
-      .copy(camera.position)
-      .addScaledVector(camera.getWorldDirection(new T.Vector3()), 15);
+    resumeOrbit();
   }
 });
 document.addEventListener("mousemove", (e) => {
